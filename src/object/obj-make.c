@@ -130,24 +130,34 @@ void check_flags(object_type *o_ptr)
  */
 static int obj_find_affix(object_type *o_ptr, int level, int affix_lev)
 {
-	int i, j, success = 0;
+	int i, j, success = 0, max = 0;
 	long total = 0L;
 	alloc_entry *table;
 	ego_item_type *ego;
 
 	table = C_ZNEW(z_info->e_max, alloc_entry);
 
+	/* Find the max depth of all affixes already on the object */
+	for (i = 0; i < MAX_AFFIXES; i++)
+		if (o_ptr->affix[i])
+			for (j = 0; j < EGO_TVALS_MAX; j++)
+				if (o_ptr->tval == o_ptr->affix[i]->tval[j] &&
+						o_ptr->sval >= o_ptr->affix[i]->min_sval[j] &&
+						o_ptr->sval <= o_ptr->affix[i]->max_sval[j] &&
+						o_ptr->affix[i]->alloc_max[j] > max)
+					max = o_ptr->affix[i]->alloc_max[j];
+
 	/* Go through all possible affixes and find ones legal for this item */
 	for (i = 0; i < z_info->e_max; i++) {
 		ego = &e_info[i];
 
-		/* Test if this is a legal ego-item type for this object & level */
+		/* Test if this is a legal affix type for this object & level */
 		for (j = 0; j < EGO_TVALS_MAX; j++) {
 			if (o_ptr->tval == ego->tval[j] &&
 					o_ptr->sval >= ego->min_sval[j] &&
 					o_ptr->sval <= ego->max_sval[j] &&
 					level >= ego->alloc_min[j] &&
-					level <= ego->alloc_max[j] &&
+					(level <= ego->alloc_max[j] || level <= max) &&
 					affix_lev >= ego->level[j]) {
 				table[i].prob3 = ego->alloc_prob[j];
 				table[i].index = ego->eidx;
