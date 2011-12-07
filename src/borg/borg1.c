@@ -457,6 +457,7 @@ s16b borg_resistance;  /* borg is Resistant to all elements */
 s16b borg_no_rest_prep; /* borg wont rest for a few turns */
 
 bool borg_shield;
+bool borg_stone;
 bool borg_on_glyph;    /* borg is standing on a glyph of warding */
 bool borg_create_door;    /* borg is going to create doors */
 bool borg_sleep_spell;
@@ -473,6 +474,7 @@ bool borg_in_shop = FALSE;  /* True if the borg is inside of a store */
 s16b goal_shop = -1;        /* Next shop to visit */
 s16b goal_ware = -1;        /* Next item to buy there */
 s16b goal_item = -1;        /* Next item to sell there */
+s16b goal_qty = 1;
 int borg_food_onsale = -1;      /* Are shops selling food? */
 int borg_fuel_onsale = -1;      /* Are shops selling fuel? */
 bool borg_needs_quick_shopping = FALSE; /* Needs to buy without browsing all shops */
@@ -713,6 +715,7 @@ s16b num_cure_serious;
 
 s16b num_pot_rheat;
 s16b num_pot_rcold;
+s16b num_pot_rpois;
 
 s16b num_missile;
 
@@ -1957,7 +1960,7 @@ void borg_update_frame(void)
     borg_skill[BI_TRPOIS] = (p_ptr->timed[TMD_OPP_POIS] ? TRUE : FALSE);
     borg_bless = (p_ptr->timed[TMD_BLESSED] ? TRUE : FALSE);
     borg_shield = (p_ptr->timed[TMD_SHIELD] ? TRUE : FALSE);
-    borg_shield = (p_ptr->timed[TMD_STONESKIN] ? TRUE : FALSE);
+    borg_stone = (p_ptr->timed[TMD_STONESKIN] ? TRUE : FALSE);
     borg_hero = (p_ptr->timed[TMD_HERO] ? TRUE : FALSE);
     borg_berserk = (p_ptr->timed[TMD_SHERO] ? TRUE : FALSE);
 

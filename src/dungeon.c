@@ -978,7 +978,7 @@ static void process_player(void)
 			}
 		}
 	}
-
+#ifndef ALLOW_BORG
 	/* Check for "player abort" */
 	if (p_ptr->running ||
 	    cmd_get_nrepeats() > 0 ||
@@ -998,7 +998,7 @@ static void process_player(void)
 			msg("Cancelled.");
 		}
 	}
-
+#endif
 
 	/*** Handle actual user input ***/
 

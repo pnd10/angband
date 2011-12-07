@@ -276,6 +276,8 @@ extern bool borg_activate_dragon(int drag_sval); /*  */
 extern bool borg_equips_dragon(int drag_sval);  /*  */
 extern bool borg_activate_item(int tval, int sval, bool target);
 extern bool borg_equips_item(int tval, int sval);
+extern bool borg_has_effect(int effect, bool legal);
+extern bool borg_activate_effect(int effect, bool target);
 extern bool borg_activate_ring(int ring_sval); /*  */
 extern bool borg_equips_ring(int ring_sval);  /*  */
 

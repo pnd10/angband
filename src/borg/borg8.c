@@ -23,6 +23,12 @@ byte *test;
 byte *best;
 s32b *b_home_power;
 
+char *borg_itoa(long i, char* s, int dummy_radix)
+{
+    sprintf(s, "%ld", i);
+    return s;
+}
+
 
 /* money Scumming is a type of town scumming for money */
 bool borg_money_scum(void)
@@ -1126,13 +1132,13 @@ static bool borg_think_shop_sell_aux(void)
 
     int k, b_k = -1;
     int i, b_i = -1;
-    int qty = 1;
     s32b p, b_p = 0L;
-    s32b c = 0L;
-    s32b b_c = 30001L;
+	int q, q_max, b_q = 1;
+	int full_shop;
+
 
     bool fix = FALSE;
-
+	bool absorb = FALSE;
 
     /* Evaluate */
     b_p = my_power;
@@ -1140,8 +1146,7 @@ static bool borg_think_shop_sell_aux(void)
     /* Check each shop */
     for (k = 0; k < (MAX_STORES -1) ; k++)
     {
-        /* Hack -- Skip "full" shops */
-        if (borg_shops[k].ware[icky].iqty) continue;
+		full_shop = borg_shops[k].ware[icky].iqty;
 
         /* Save the store hole */
         COPY(&safe_shops[k].ware[icky], &borg_shops[k].ware[icky], borg_item);
@@ -1179,6 +1184,33 @@ static bool borg_think_shop_sell_aux(void)
             /* Skip "bad" sales */
             if (!borg_good_sell(item, k)) continue;
 
+			/* Hack -- Skip "full" shops unless the shop can merge the item */
+			if (full_shop >= 1)
+			{
+				/* compare my item to the shop's inventory to see if it blends.
+				 * But for now, just merge books.
+				 */
+				absorb = FALSE;
+				for (q = 0; q < icky; q++)
+				{
+					if (borg_shops[k].ware[q].tval == item->tval &&
+						borg_shops[k].ware[q].sval == item->sval &&
+						borg_shops[k].ware[q].iqty + item->iqty <= 99 &&
+						borg_shops[k].ware[q].to_a == item->to_a &&
+						borg_shops[k].ware[q].to_h == item->to_h &&
+						borg_shops[k].ware[q].to_d == item->to_d &&
+						borg_shops[k].ware[q].dd  == item->dd  &&
+						borg_shops[k].ware[q].ds  == item->ds)
+					{
+						absorb = TRUE;
+						break;
+					}
+				}
+
+				/* Cant buy this, too full */
+				if (!absorb) continue;
+			}
+
             /* Save the item */
             COPY(&safe_items[i], &borg_items[i], borg_item);
 
@@ -1186,38 +1218,36 @@ static bool borg_think_shop_sell_aux(void)
             COPY(&borg_shops[k].ware[icky], &safe_items[i], borg_item);
 
             /* get the quantity */
-            qty = borg_min_item_quantity(item);
+			q_max = item->iqty;
 
-            /* Give a single item */
-            borg_shops[k].ware[icky].iqty = qty;
+			/* See how many I want to sell */
+			for (q = 1; q <= q_max; q++)
+			{
 
-            /* Lose a single item */
-            borg_items[i].iqty -=qty;
+				/* Give a single item */
+				borg_shops[k].ware[icky].iqty = q;
 
-            /* Fix later */
-            fix = TRUE;
+				/* Lose a single item */
+				borg_items[i].iqty -=1;
 
-            /* Examine the inventory */
-            borg_notice(FALSE);
+				/* Fix later */
+				fix = TRUE;
 
-            /* Evaluate the inventory */
-            p = borg_power();
+				/* Examine the inventory */
+				borg_notice(FALSE);
 
-            /* Restore the item */
-            COPY(&borg_items[i], &safe_items[i], borg_item);
+				/* Evaluate the inventory */
+				p = borg_power();
 
-            /* Ignore "bad" sales */
-            if (p < b_p) continue;
+				/* Ignore "bad" sales */
+				if (p < b_p) continue;
 
-            /* Extract the "price" */
-            c = ((item->value < 30000L) ? item->value : 30000L);
+				/* Maintain the "best" */
+				b_k = k; b_i = i; b_p = p; b_q = q;
+			}
 
-            /* sell cheap items first.  This is done because we may have to */
-            /* buy the item back in some very strange cercemstances. */
-            if ((p == b_p) && (c >= b_c)) continue;
-
-            /* Maintain the "best" */
-            b_k = k; b_i = i; b_p = p; b_c = c;
+			/* Restore the item */
+			COPY(&borg_items[i], &safe_items[i], borg_item);
         }
 
         /* Restore the store hole */
@@ -1235,6 +1265,7 @@ static bool borg_think_shop_sell_aux(void)
 
         /* Sell that item */
         goal_item = b_i;
+        goal_qty = b_q;
 
         /* Success */
         return (TRUE);
@@ -1425,12 +1456,12 @@ static bool borg_think_shop_buy_aux(void)
     int hole = INVEN_MAX_PACK - 1;
 
     int slot;
-    int qty =1;
-
+	int qty = 1;
     int k, b_k = -1;
     int n, b_n = -1;
     s32b p, b_p = 0L;
     s32b c, b_c = 0L;
+	int q, q_max, b_q = -1;
 
     bool fix = FALSE;
 
@@ -1496,11 +1527,9 @@ static bool borg_think_shop_buy_aux(void)
             /* Save hole */
             COPY(&safe_items[hole], &borg_items[hole], borg_item);
 
-            /* Save the number to trade */
-            qty = borg_min_item_quantity(item);
 
-            /* Remove one item from shop (sometimes) */
-            borg_shops[k].ware[n].iqty -= qty;
+            /* Save the number to trade */
+            q_max = borg_shops[k].ware[n].iqty;
 
             /* Obtain "slot" */
             slot = borg_wield_slot(item);
@@ -1560,52 +1589,67 @@ static bool borg_think_shop_buy_aux(void)
 
                 /* Restore old item */
                 COPY(&borg_items[slot], &safe_items[slot], borg_item);
+				/* Obtain the "cost" of the item */
+				c = item->cost * qty;
+
+				/* Ignore "bad" purchases */
+				if (p <= b_p) continue;
+
+				/* Ignore "expensive" purchases */
+				if ((p == b_p) && (c >= b_c)) continue;
+
+				/* Save the item and cost */
+				b_k = k; b_n = n; b_p = p; b_c = c; b_q = 1;
             }
 
             /* Consider new inventory */
             else
             {
-                /* Move new item into inventory */
-                COPY(&borg_items[hole], &safe_shops[k].ware[n], borg_item);
+				/* See how many items I want to buy */
+				for (q = 1; q <= q_max; q++)
+				{
+					/* Obtain the "cost" of the item */
+					c = item->cost * q;
 
-                /* Only a single item */
-                borg_items[hole].iqty = qty;
+					/* Too expensive to purchase this many */
+					if (c > borg_gold) continue;
 
-                /* Fix later */
-                fix = TRUE;
+					/* Remove one item from shop for each loop-pass */
+					borg_shops[k].ware[n].iqty -= 1;
 
-                /* Examine the inventory */
-                borg_notice(FALSE);
+					/* Move new item into inventory */
+					COPY(&borg_items[hole], &safe_shops[k].ware[n], borg_item);
 
-                /* Evaluate the equipment */
-                p = borg_power();
-            }
+					/* multiple items, if available */
+					borg_items[hole].iqty = q;
 
+					/* Fix later */
+					fix = TRUE;
 
-            /* Restore hole */
-            COPY(&borg_items[hole], &safe_items[hole], borg_item);
+					/* Examine the inventory */
+					borg_notice(FALSE);
 
-            /* Restore shop item */
-            COPY(&borg_shops[k].ware[n], &safe_shops[k].ware[n], borg_item);
+					/* Evaluate the equipment */
+					p = borg_power();
 
-            /* Obtain the "cost" of the item */
-            c = item->cost * qty;
+					/* Ignore "bad" purchases */
+					if (p <= b_p) continue;
 
-#if 0
-            /* Penalize the cost of expensive items */
-            if (c > borg_gold / 10) p -= c;
-#endif
+					/* Ignore "expensive" purchases */
+					if ((p == b_p) && (c >= b_c)) continue;
 
-            /* Ignore "bad" purchases */
-            if (p <= b_p) continue;
+					/* Save the item and cost */
+					b_k = k; b_n = n; b_p = p; b_c = c; b_q = q;
+				}
+			}
 
-            /* Ignore "expensive" purchases */
-            if ((p == b_p) && (c >= b_c)) continue;
+			/* Restore hole */
+			COPY(&borg_items[hole], &safe_items[hole], borg_item);
 
-            /* Save the item and cost */
-            b_k = k; b_n = n; b_p = p; b_c = c;
-        }
-    }
+			/* Restore shop item */
+			COPY(&borg_shops[k].ware[n], &safe_shops[k].ware[n], borg_item);
+		} /* Ware loop */
+    } /* Store loop */
 
 
     /* Examine the inventory */
@@ -1619,6 +1663,7 @@ static bool borg_think_shop_buy_aux(void)
 
         /* Buy that item */
         goal_ware = b_n;
+        goal_qty = b_q;
 
         /* Success */
         return (TRUE);
@@ -1638,11 +1683,11 @@ static bool borg_think_home_buy_aux(void)
 	int hole = INVEN_MAX_PACK - 1;
     int slot, i;
     int stack;
-    int qty=1;
     int n, b_n = -1;
     s32b p, b_p = 0L;
     s32b p_left = 0;
     s32b p_right = 0;
+	int q, q_max, b_q = 1;
 
     bool fix = FALSE;
 	bool skip_it = FALSE;
@@ -1681,11 +1726,8 @@ static bool borg_think_home_buy_aux(void)
         /* Save hole */
         COPY(&safe_items[hole], &borg_items[hole], borg_item);
 
-        /* Save the number */
-        qty = borg_min_item_quantity(item);
-
-        /* Remove one item from shop (sometimes) */
-        borg_shops[7].ware[n].iqty -= qty;
+        /* Save the number to trade */
+        q_max = borg_shops[7].ware[n].iqty;
 
         /* Obtain "slot" */
         slot = borg_wield_slot(item);
@@ -1717,7 +1759,7 @@ static bool borg_think_home_buy_aux(void)
                     COPY(&borg_items[slot], &safe_shops[7].ware[n], borg_item);
 
                     /* Only a single item */
-                    borg_items[slot].iqty = qty;
+                    borg_items[slot].iqty = b_q;
 
                     /* Fix later */
                     fix = TRUE;
@@ -1751,7 +1793,7 @@ static bool borg_think_home_buy_aux(void)
                     COPY(&borg_items[INVEN_RIGHT], &safe_shops[7].ware[n], borg_item);
 
                     /* Only a single item */
-                    borg_items[INVEN_RIGHT].iqty = qty;
+                    borg_items[INVEN_RIGHT].iqty = b_q;
 
                     /* Fix later */
                     fix = TRUE;
@@ -1792,7 +1834,7 @@ static bool borg_think_home_buy_aux(void)
                 COPY(&borg_items[slot], &safe_shops[7].ware[n], borg_item);
 
                 /* Only a single item */
-                borg_items[slot].iqty = qty;
+                borg_items[slot].iqty = b_q;
 
                 /* Fix later */
                 fix = TRUE;
@@ -1810,44 +1852,61 @@ static bool borg_think_home_buy_aux(void)
                 /* Restore old item */
                 COPY(&borg_items[slot], &safe_items[slot], borg_item);
             } /* non rings */
+
+			/* Ignore "silly" purchases */
+			if (p <= b_p) continue;
+
+			/* Save the item and cost */
+			b_n = n; b_p = p; b_q = 1;
+
         } /* equip */
 
         /* Consider new inventory */
         else
         {
-			if (stack != -1) hole = stack;
-
-		    /* Require one empty slot */
-			if (stack == -1 && borg_items[INVEN_MAX_PACK-1].iqty) continue;
-			if (stack == -1 && borg_items[INVEN_MAX_PACK-2].iqty) continue;
-
-			/* Save hole (could be either empty slot or stack */
-		    COPY(&safe_items[hole], &borg_items[hole], borg_item);
-
-			/* Move new item into inventory */
-			COPY(&borg_items[hole], &safe_shops[7].ware[n], borg_item);
-
-			/* Is this new item merging into an exisiting stack? */
-			if (stack != -1)
+			for (q = 1; q <= q_max; q++)
 			{
-				/* Add a quantity to the stack */
-				borg_items[hole].iqty = safe_items[hole].iqty + qty;
-			}
-			else
-			{
-				/* Only a single item */
-				borg_items[hole].iqty = qty;
-			}
+				if (stack != -1) hole = stack;
 
-			/* Fix later */
-			fix = TRUE;
+				/* Require one empty slot */
+				if (stack == -1 && borg_items[INVEN_MAX_PACK-1].iqty) continue;
+				if (stack == -1 && borg_items[INVEN_MAX_PACK-2].iqty) continue;
 
-			/* Examine the inventory */
-			borg_notice(FALSE);
+				/* Save hole (could be either empty slot or stack */
+				COPY(&safe_items[hole], &borg_items[hole], borg_item);
 
-			/* Evaluate the equipment */
-			p = borg_power();
-        }
+				/* Move new item into inventory */
+				COPY(&borg_items[hole], &safe_shops[7].ware[n], borg_item);
+
+				/* Is this new item merging into an exisiting stack? */
+				if (stack != -1)
+				{
+					/* Add a quantity to the stack */
+					borg_items[hole].iqty = safe_items[hole].iqty + q;
+				}
+				else
+				{
+					/* Adding a qty to my inventory */
+					borg_items[hole].iqty = q;
+				}
+
+				/* Fix later */
+				fix = TRUE;
+
+				/* Examine the inventory */
+				borg_notice(FALSE);
+
+				/* Evaluate the equipment */
+				p = borg_power();
+
+				/* Ignore "silly" purchases */
+				if (p <= b_p) continue;
+
+				/* Save the item and cost */
+				b_n = n; b_p = p; b_q = q;
+
+			}/* Qty loop */
+		}
 
         /* Restore hole */
         COPY(&borg_items[hole], &safe_items[hole], borg_item);
@@ -1855,11 +1914,6 @@ static bool borg_think_home_buy_aux(void)
         /* Restore shop item */
         COPY(&borg_shops[7].ware[n], &safe_shops[7].ware[n], borg_item);
 
-        /* Ignore "silly" purchases */
-        if (p <= b_p) continue;
-
-        /* Save the item and cost */
-        b_n = n; b_p = p;
     }
 
     /* Examine the inventory */
@@ -1873,6 +1927,7 @@ static bool borg_think_home_buy_aux(void)
 
         /* Buy that item */
         goal_ware = b_n;
+        goal_qty = b_q;
 
         /* Success */
         return (TRUE);
@@ -2010,10 +2065,11 @@ static bool borg_think_shop_grab_aux(void)
  */
 static bool borg_think_home_grab_aux(void)
 {
-    int p, n, b_n = -1;
-    s32b s, b_s = 0L;
-    int qty=1;
+    int n, b_n = -1;
+	int p;
 	bool skip_it = FALSE;
+    s32b s, b_s = 0L;
+	int q, q_max, b_q = 1;
 
     /* Require two empty slots */
     if (borg_items[INVEN_MAX_PACK-1].iqty) return (FALSE);
@@ -2046,26 +2102,31 @@ static bool borg_think_home_grab_aux(void)
         /* Save shop item */
         COPY(&safe_shops[7].ware[n], &borg_shops[7].ware[n], borg_item);
 
-        /* Save the number */
-        qty = borg_min_item_quantity(item);
+		/* Max quantity */
+		q_max = borg_shops[7].ware[n].iqty;
 
-        /* Remove one item from shop */
-        borg_shops[7].ware[n].iqty -= qty;
+		/* See how many we want to grab */
+		for (q = 1; q <= q_max; q++)
+		{
+			/* Remove one item from shop for each pass */
+			borg_shops[7].ware[n].iqty -= 1;
 
-        /* Examine the home */
-        borg_notice_home(NULL, FALSE);
+			/* Examine the home */
+			borg_notice_home(NULL, FALSE);
 
-        /* Evaluate the home */
-        s = borg_power_home();
+			/* Evaluate the home */
+			s = borg_power_home();
+
+			/* Ignore "bad" sales */
+			if (s < b_s) continue;
+
+			/* Maintain the "best" */
+			b_n = n; b_s = s; b_q = q;
+		}
 
         /* Restore shop item */
         COPY(&borg_shops[7].ware[n], &safe_shops[7].ware[n], borg_item);
 
-        /* Ignore "bad" sales */
-        if (s < b_s) continue;
-
-        /* Maintain the "best" */
-        b_n = n; b_s = s;
     }
 
     /* Examine the home */
@@ -2082,6 +2143,7 @@ static bool borg_think_home_grab_aux(void)
 
         /* Grab that item */
         goal_ware = b_n;
+		goal_qty = b_q;
 
         /* Success */
         return (TRUE);
@@ -2557,20 +2619,12 @@ static bool borg_choose_shop(void)
  */
 static bool borg_think_shop_sell(void)
 {
-    int qty= 1;
-
+	char buf[3];
 
     /* Sell something if requested */
     if ((goal_shop == shop_num) && (goal_item >= 0))
     {
         borg_item *item = &borg_items[goal_item];
-
-        qty = borg_min_item_quantity(item);
-
-        /* Remove the inscription */
-        /* 309 does not allow for } while in the store */
-        /* if (item->tval == TV_FOOD) borg_send_deinscribe(goal_item); */
-
 
         /* Log */
         borg_note(format("# Selling %s", item->desc));
@@ -2581,15 +2635,10 @@ static bool borg_think_shop_sell(void)
         /* Buy the desired item */
         borg_keypress(I2A(goal_item));
 
-        /* Hack -- Sell a single item */
-        if (item->iqty > 1 || qty >= 2)
-        {
-            if (qty == 5) borg_keypress('5');
-            if (qty == 4) borg_keypress('4');
-            if (qty == 3) borg_keypress('3');
-            if (qty == 2) borg_keypress('2');
-	        borg_keypress('\n');
-        }
+        /* Hack -- Sell a qty of the item */
+        borg_itoa(goal_qty, buf, 10);
+		borg_keypresses(buf);
+        borg_keypress('\n');
 
         /* Mega-Hack -- Accept the price */
         if (goal_shop != 7)
@@ -2612,6 +2661,7 @@ static bool borg_think_shop_sell(void)
 
         /* The purchase is complete */
         goal_shop = goal_ware = goal_item = -1;
+		goal_qty = 1;
 
         /* tick the anti-loop clock */
         time_this_panel ++;
@@ -2636,6 +2686,7 @@ static bool borg_think_shop_sell(void)
  */
 static bool borg_think_shop_buy(void)
 {
+    char buf[3];
 	char purchase_target = '0';
 
     /* Buy something if requested */
@@ -2652,6 +2703,7 @@ static bool borg_think_shop_buy(void)
         {
             /* The purchase is complete */
 			goal_shop = goal_ware = goal_item = -1;
+			goal_qty = 1;
 
             /* Increment our clock to avoid loops */
             time_this_panel ++;
@@ -2667,14 +2719,19 @@ static bool borg_think_shop_buy(void)
         borg_keypress('p');
 
 
-        /* Mega-Hack -- Accept the price */
+		/* Quantity of the item */
+		borg_itoa(goal_qty, buf, 10);
+		borg_keypresses(buf);
         borg_keypress('\n');
+
+		/* Mega-Hack -- Accept the price */
         borg_keypress('\n');
         borg_keypress(' ');
         borg_keypress(' ');
         borg_keypress(ESCAPE);
         borg_keypress(ESCAPE);
         borg_keypress(ESCAPE);
+
 
 		/* if the borg is scumming and bought it.,
 		 * reset the scum amount.
@@ -2701,6 +2758,7 @@ static bool borg_think_shop_buy(void)
 
         /* The purchase is complete */
         goal_shop = goal_ware = goal_item = -1;
+        goal_qty = 1;
 
 		/* Increment our clock to avoid loops */
         time_this_panel ++;
@@ -3669,6 +3727,60 @@ bool borg_think_dungeon_munchkin(void)
 		return (FALSE);
 	}
 
+	/* Stairs are known, but are they too far away */
+	if (track_more_num || track_less_num)
+	{
+        int y, x;
+
+        /* Check for an existing "up stairs" */
+        for (i = 0; i < track_less_num; i++)
+        {
+            x = track_less_x[i];
+            y = track_less_y[i];
+
+            /* How far is the nearest up stairs */
+            j = distance(c_y, c_x, y, x);
+
+			/* Is it reachable or behind a wall? */
+			if (!borg_projectable(y, x, c_y, c_x)) continue;
+
+			/* skip the far ones */
+            if (b_j <= j && b_j != -1) continue;
+
+            /* track it */
+            b_j =j;
+        }
+
+        /* Check for an existing "down stairs" */
+        for (i = 0; i < track_more_num; i++)
+        {
+            x = track_more_x[i];
+            y = track_more_y[i];
+
+            /* How far is the nearest stairs */
+            j = distance(c_y, c_x, y, x);
+
+			/* Is it reachable or behind a wall? */
+			if (!borg_projectable(y, x, c_y, c_x)) continue;
+
+			/* skip the far ones */
+            if (b_j <= j && b_j != -1) continue;
+
+            /* track it */
+            b_j =j;
+        }
+
+		/* Close enough to risk it? */
+		if ((b_j > 10 || b_j == -1) && borg_danger(c_y, c_x, 1, TRUE, FALSE) > avoidance / 10)
+		{
+			borg_note("# Leaving Munchkin Mode. (No nearby stairs seen)");
+			borg_munchkin_mode = FALSE;
+			return (FALSE);
+		}
+
+	}
+
+
 	/** First deal with staying alive **/
 
     /* Hack -- require light */
@@ -4061,18 +4173,18 @@ bool borg_think_dungeon_munchkin(void)
 
 		/* Try to find some stairs */
 		if (borg_flow_stair_both(GOAL_FLEE, FALSE)) return (TRUE);
-		if (ag->feat == FEAT_LESS)
+		if (borg_grids[c_y][c_x].feat == FEAT_LESS)
 		{
 			/* Take the Up Stair */
 	        borg_on_dnstairs = TRUE;
 	        borg_keypress('<');
 			return (TRUE);
 		}
-		if (ag->feat == FEAT_MORE)
+		if (borg_grids[c_y][c_x].feat == FEAT_MORE)
 		{
 			/* Take the Stair */
 	        borg_on_upstairs = TRUE;
-	        borg_keypress('<');
+	        borg_keypress('>');
 			return (TRUE);
 		}
 	}

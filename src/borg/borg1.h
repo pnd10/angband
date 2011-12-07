@@ -304,6 +304,7 @@
 #define RING_FLAMES			207
 #define RING_ACID			208
 #define RING_ICE			209
+#define RING_ONE			13 /* the name1 value of the ring of power */
 #define RING_LIGHTNING		210
 
 
@@ -1233,6 +1234,7 @@ extern s16b borg_game_ratio;
 extern s16b borg_resistance;
 extern s16b borg_no_rest_prep; /* borg wont rest for a few turns */
 extern bool borg_shield;
+extern bool borg_stone;
 extern bool borg_on_glyph; /* borg is standing on a glyph of warding */
 extern bool borg_create_door; /* borg is going to create doors */
 extern bool borg_sleep_spell;
@@ -1249,6 +1251,8 @@ extern bool borg_in_shop;
 extern s16b goal_shop;      /* Next shop to visit */
 extern s16b goal_ware;      /* Next item to buy there */
 extern s16b goal_item;      /* Next item to sell there */
+extern s16b goal_qty;
+
 extern int borg_food_onsale;      /* Are shops selling food? */
 extern int borg_fuel_onsale;      /* Are shops selling fuel? */
 extern bool borg_needs_quick_shopping; /* Needs to buy without browsing all shops */
@@ -1475,6 +1479,7 @@ extern s16b num_cure_serious;
 
 extern s16b num_pot_rheat;
 extern s16b num_pot_rcold;
+extern s16b num_pot_rpois;
 
 extern s16b num_missile;
 

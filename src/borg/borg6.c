@@ -14,6 +14,7 @@
 #include "borg6.h"
 #include "borg7.h"
 
+static bool borg_flow_commit(char *who, int why);
 
 static bool borg_desperate = FALSE;
 
@@ -264,7 +265,7 @@ static void borg_flow_clear(void)
  * "Sneak" will have the borg avoid grids which are adjacent to a monster.
  *
  */
-static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunneling, int stair_idx, bool sneak)
+static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunneling, int stair_idx, bool sneak, bool monster)
 {
     int i;
     int n, o = 0;
@@ -346,7 +347,7 @@ static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunnelin
             ag = &borg_grids[y][x];
 
 
-			if (sneak)
+			if (sneak && !monster)
 			{
 				/* Scan the neighbors */
 				for (ii = 0; ii < 8; ii++)
@@ -370,10 +371,26 @@ static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunnelin
 				}
 			}
 			/* The grid I am thinking about is adjacent to a monster */
-			if (sneak && bad_sneak && !borg_desperate && !twitchy) continue;
+			if (sneak && !monster && bad_sneak && !borg_desperate && !twitchy) continue;
 
 			/* Avoid "wall" grids (not doors) unless tunneling*/
-            if (!tunneling && ag->feat >= FEAT_SECRET) continue;
+            if (!tunneling && !monster)
+			{
+				if (borg_skill[BI_CLEVEL] < 10 && ag->feat >= FEAT_SECRET) continue;
+				if (borg_skill[BI_CLEVEL] >= 10 && ag->feat > FEAT_RUBBLE) continue;
+			}
+
+			/* Avoid difficult tunneling */
+            if (tunneling && !monster)
+			{
+				if (!borg_spell_legal(2, 2) &&
+					!borg_equips_ring(SV_RING_DELVING) &&
+					!borg_equips_artifact(EFF_STONE_TO_MUD, INVEN_WIELD) &&
+					(borg_skill[BI_DIG] < BORG_DIG &&
+				     (borg_items[weapon_swap].tval != TV_DIGGING && borg_items[weapon_swap].tval != TV_DIGGING)) &&
+					(borg_skill[BI_DIG] < BORG_DIG + 20) && goal != GOAL_VAULT)
+					 continue;
+			}
 
             /* Avoid "perma-wall" grids */
             if (ag->feat >= FEAT_PERM_EXTRA) continue;
@@ -381,14 +398,14 @@ static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunnelin
             /* Avoid unknown grids (if requested or retreating)
 			 * unless twitchy.  In which case, expore it
 			 */
-			if ((avoid || borg_desperate) && (ag->feat == FEAT_NONE) &&
+			if ((avoid || borg_desperate)  && !monster && (ag->feat == FEAT_NONE) &&
 				!twitchy) continue;
 
             /* Avoid Monsters if Desprerate, lunal */
-            if ((ag->kill) && (borg_desperate || borg_lunal_mode || borg_munchkin_mode)) continue;
+            if ((ag->kill) && !monster && (borg_desperate || borg_lunal_mode || borg_munchkin_mode)) continue;
 
             /* Avoid Monsters if low level, unless twitchy */
-            if ((ag->kill) && !twitchy &&
+            if ((ag->kill) && !monster && !twitchy &&
 				borg_skill[BI_FOOD] >= 2 && borg_skill[BI_MAXCLEVEL] < 5) continue;
 
 			/* Avoid shop entry points if I am not heading to that shop */
@@ -398,7 +415,7 @@ static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunnelin
 
 			/* Avoid Traps if low level-- unless brave */
             if (ag->feat >= FEAT_TRAP_HEAD && ag->feat <= FEAT_TRAP_TAIL &&
-                !twitchy)
+                !twitchy && !monster)
            	{
                 /* Do not disarm when you could end up dead */
                 if (borg_skill[BI_CURHP] < 60) continue;
@@ -572,7 +589,7 @@ static int borg_flow_cost_stair(int y, int x, int b_stair)
     borg_flow_enqueue_grid(track_less_y[b_stair],track_less_x[b_stair]);
 
     /* Spread, but do NOT optimize */
-    borg_flow_spread(250, FALSE, FALSE, FALSE, b_stair, FALSE);
+    borg_flow_spread(250, FALSE, FALSE, FALSE, b_stair, FALSE, FALSE);
 
 	/* Distance from the grid to the stair */
 	cost = borg_data_cost->data[y][x];
@@ -584,7 +601,7 @@ static int borg_flow_cost_stair(int y, int x, int b_stair)
 /*
  * Do a "reverse" flow from the player outwards
  */
-static void borg_flow_reverse(int depth, bool optimize, bool avoid, bool tunneling, int stair_idx, bool sneak)
+static void borg_flow_reverse(int depth, bool optimize, bool avoid, bool tunneling, int stair_idx, bool sneak, bool monster)
 {
     /* Clear the flow codes */
     borg_flow_clear();
@@ -593,11 +610,413 @@ static void borg_flow_reverse(int depth, bool optimize, bool avoid, bool tunneli
     borg_flow_enqueue_grid(c_y, c_x);
 
     /* Spread, but do NOT optimize */
-    borg_flow_spread(depth, optimize, avoid, tunneling, stair_idx, sneak);
+    borg_flow_spread(depth, optimize, avoid, tunneling, stair_idx, sneak, monster);
 }
 
 
 
+
+/*
+ * We want the borg to be able to fight summoning monster while both are in
+ * a hallway.  This will reduce the summoners ability to summon.
+ * We check to see if the borg is in a good hallway and if a monster is able
+ * to flow into the hallway.
+ *
+ * This is called from borg_defend() which is called up in borg_caution() which
+ * is called before any borg_flow_xxx() are called.  There is a
+ * borg_flow_kill_corridor_1() whill have the borg dig an anti-summon corridor.
+ * It is always called after this funciton, if at all.  Since that AS-corridor
+ * is far safer than just resting in a hallway.  We want to make sure this
+ * routine will fail if we beleive the other one is a better option for us.
+ * So the major difference is whether or not the hallway will be suitable for a
+ * AS-corridor.  If it is not, then we should consider this an a good alternative.
+ *
+ * The arrays below are used to determine the pattern of the walls near us.
+ * The arrays need to match exactly to the ones in borg_flow_corridor_1()
+ * Look at wall array to see if it is acceptable
+ * We want to find this in the array:
+ *
+ * #####  ..@..  ####.  .####
+ * ##.##  ##.##	 ##.#.  .#.##
+ * #.#.#  #.#.#  #.#.@  @.#.#
+ * ##.##  ##.##  ##.#.  .#.##
+ * ..@..  #####  ####.  .####
+ *
+ * NORTH  SOUTH  WEST   East
+ *
+ */
+static bool borg_lure_monster(void)
+{
+	bool hallway = FALSE;
+	int i;
+    int o_y = 0;
+	int o_x = 0;
+    int m_x = 0;
+	int m_y = 0;
+
+	int n_array[25] = {1,0,0,0,1,
+					   1,0,1,0,1,
+					   0,1,0,1,0,
+					   0,0,1,0,0,
+					   1,1,1,1,1};
+	int ny[25] = {-4,-4,-4,-4,-4,-3,-3,-3,-3,-3,-2,-2,-2,-2,-2,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0};
+	int nx[25] = {-2,-1, 0, 1, 2,-2,-1, 0, 1, 2,-2,-1, 0, 1, 2,-2,-1, 0, 1, 2,-2,-1, 0, 1, 2};
+
+	int s_array[25] = {1,1,1,1,1,
+		               0,0,1,0,0,
+					   0,1,0,1,0,
+					   1,0,1,0,1,
+					   1,0,0,0,1};
+	int sy[25] = { 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4};
+	int sx[25] = {-2,-1, 0, 1, 2,-2,-1, 0, 1, 2,-2,-1, 0, 1, 2,-2,-1, 0, 1, 2,-2,-1, 0, 1, 2};
+
+	int e_array[25] = {1,0,0,1,1,
+		               1,0,1,0,0,
+					   1,1,0,1,0,
+					   1,0,1,0,0,
+					   1,0,0,1,1};
+	int ey[25] = {-2,-2,-2,-2,-2,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2};
+	int ex[25] = { 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4};
+
+	int w_array[25] = {1,1,0,0,1,
+		               0,0,1,0,1,
+					   0,1,0,1,1,
+					   0,0,1,0,1,
+					   1,1,0,0,1};
+	int wy[25] = {-2,-2,-2,-2,-2,-1,-1,-1,-1,-1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2};
+	int wx[25] = {-4,-3,-2,-1, 0,-4,-3,-2,-1, 0,-4,-3,-2,-1, 0,-4,-3,-2,-1, 0,-4,-3,-2,-1, 0};
+
+	int wall_north = 0;
+	int wall_south = 0;
+	int wall_east = 0;
+	int wall_west = 0;
+
+	borg_digging = FALSE;
+
+	/* Is the borg in a hallway?
+     * check for 'in a hall' x axis
+     * This check is for this:
+     *
+     *      x
+     *    ..@..
+     *      x
+     *
+     * 'x' being 'not a floor' and '.' being a floor.
+     *
+     */
+
+
+	/* Check for 'in a hall' x axis. */
+    if ((borg_grids[c_y+1][c_x].feat == FEAT_FLOOR &&
+        borg_grids[c_y+2][c_x].feat == FEAT_FLOOR &&
+        borg_grids[c_y-1][c_x].feat == FEAT_FLOOR &&
+        borg_grids[c_y-2][c_x].feat == FEAT_FLOOR) &&
+        (borg_grids[c_y][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y][c_x-1].feat != FEAT_FLOOR &&
+         borg_grids[c_y+1][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y+1][c_x-1].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x-1].feat != FEAT_FLOOR &&
+         borg_grids[c_y+1][c_x+2].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x+2].feat != FEAT_FLOOR &&
+         borg_grids[c_y+1][c_x-2].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x-2].feat != FEAT_FLOOR))
+        hallway = TRUE;
+
+    /* check for 'in a hall' y axis.
+     */
+    if ((borg_grids[c_y][c_x+1].feat == FEAT_FLOOR &&
+        borg_grids[c_y][c_x+2].feat == FEAT_FLOOR &&
+        borg_grids[c_y][c_x-1].feat == FEAT_FLOOR &&
+        borg_grids[c_y][c_x-2].feat == FEAT_FLOOR) &&
+        (borg_grids[c_y+1][c_x].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x].feat != FEAT_FLOOR &&
+         borg_grids[c_y+1][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y+1][c_x-1].feat != FEAT_FLOOR &&
+         borg_grids[c_y-1][c_x-1].feat != FEAT_FLOOR &&
+         borg_grids[c_y+2][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y-2][c_x+1].feat != FEAT_FLOOR &&
+         borg_grids[c_y+2][c_x-1].feat != FEAT_FLOOR &&
+         borg_grids[c_y-2][c_x-1].feat != FEAT_FLOOR))
+        hallway = TRUE;
+
+	/* Resting in this hallway might be a good idea.  */
+	if (hallway == TRUE)
+	{
+		int q_x;
+		int q_y;
+
+		/* Scan the monster list */
+		for (i = 1; i < borg_kills_nxt; i++)
+		{
+			borg_kill *kill;
+
+			/* Monster */
+			kill = &borg_kills[i];
+
+			/* Skip dead monsters */
+			if (!kill->r_idx) continue;
+
+			/* Can anyone see me and attack? */
+			if (borg_los(kill->y, kill->x, c_y, c_x) && kill->ranged_attack) continue;
+
+			/* Is one standing right next to me? */
+			if (distance(kill->y, kill->x, c_y, c_x) == 1) continue;
+
+			/* Ignore monsters who can pass through walls or never move  */
+			if (rf_has(r_info[kill->r_idx].flags, RF_PASS_WALL)) continue;
+			if (rf_has(r_info[kill->r_idx].flags, RF_KILL_WALL)) continue;
+			if (rf_has(r_info[kill->r_idx].flags, RF_NEVER_MOVE)) continue;
+			if (!kill->awake) continue;
+
+			/* Is it a summoner? */
+			if (!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_KIN) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_HI_DEMON) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_MONSTER) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_MONSTERS) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_ANIMAL) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_SPIDER) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_HOUND) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_HYDRA) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_AINU) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_DEMON) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_UNDEAD) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_DRAGON) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_HI_UNDEAD) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_WRAITH) &&
+				!rsf_has(r_info[kill->r_idx].spell_flags, RSF_S_UNIQUE) ) continue;
+
+
+			/* Can the monster flow to me? */
+			/* Extract panel */
+			q_x = w_x / PANEL_WID;
+			q_y = w_y / PANEL_HGT;
+
+			if (borg_detect_wall[q_y+0][q_x+0] == TRUE &&
+				borg_detect_wall[q_y+0][q_x+1] == TRUE &&
+				borg_detect_wall[q_y+1][q_x+0] == TRUE &&
+				borg_detect_wall[q_y+1][q_x+1] == TRUE)
+			{
+				borg_flow_clear();
+				borg_digging = TRUE;
+				borg_flow_enqueue_grid(kill->y, kill->x);
+				borg_flow_spread(15, TRUE, FALSE, FALSE, -1, FALSE, TRUE);
+				if (!borg_flow_commit(NULL, GOAL_KILL)) continue;
+			}
+			else
+			{
+				borg_flow_clear();
+				borg_digging = TRUE;
+				borg_flow_enqueue_grid(kill->y, kill->x);
+				borg_flow_spread(15, TRUE, TRUE, FALSE, -1, FALSE, TRUE);
+				if (!borg_flow_commit(NULL, GOAL_KILL)) continue;
+			}
+
+	 		/* Check to see if this hallway would be better used as an AS-Corridor.
+			 * Must be able to excavate since digging takes time
+			 */
+			if (borg_spell_okay(2, 2) ||
+				borg_has_effect(EFF_STONE_TO_MUD, FALSE))
+			{
+				/* NORTH -- Consider each area near the borg, looking for a good spot to hide */
+				for (o_y = -2; o_y < 1; o_y++)
+				{
+					/* Resest Wall count */
+					wall_north = 0;
+
+					/* No E-W offset when looking North-South */
+					o_x = 0;
+
+					for (i = 0; i < 25; i++)
+					{
+						borg_grid *ag;
+
+						/* Check grids near borg */
+						m_y = c_y + o_y + ny[i];
+						m_x = c_x + o_x + nx[i];
+
+						/* avoid screen edgeds */
+						if (!in_bounds_fully(m_y, m_x))	continue;
+
+						/* grid the grid */
+						ag = &borg_grids[m_y][m_x];
+
+						/* Certain grids must not be floor types */
+						if (n_array[i] == 0 && ((ag->feat == FEAT_NONE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* This is a good grid */
+							wall_north++;
+						}
+						if (n_array[i] == 1 && ((ag->feat <= FEAT_MORE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* A good wall would score 25. */
+							wall_north++;
+						}
+					}
+
+					/* If I found 25 grids, then that spot will work well for a as-corridor. */
+					if (wall_north == 25)
+					{
+						return (FALSE);
+					}
+				}
+
+				/* SOUTH -- Consider each area near the borg, looking for a good spot to hide */
+				for (o_y = -1; o_y < 2; o_y++)
+				{
+					/* Resest Wall count */
+					wall_south = 0;
+
+					for (i = 0; i < 25; i++)
+					{
+						borg_grid *ag;
+
+						/* No lateral offset on South check */
+						o_x = 0;
+
+						/* Check grids near borg */
+						m_y = c_y + o_y + sy[i];
+						m_x = c_x + o_x + sx[i];
+
+						/* avoid screen edgeds */
+						if (!in_bounds_fully(m_y, m_x)) continue;
+
+						/* grid the grid */
+						ag = &borg_grids[m_y][m_x];
+
+						/* Certain grids must not be floor types */
+						if (s_array[i] == 0 && ((ag->feat == FEAT_NONE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* This is a good grid */
+							wall_south++;
+						}
+						if (s_array[i] == 1 && ((ag->feat <= FEAT_MORE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* A good wall would score 25. */
+							wall_south++;
+						}
+					}
+
+					/* If I found 25 grids, then that spot will work well */
+					if (wall_south == 25)
+					{
+						return (FALSE);
+					}
+				}
+
+				/* EAST -- Consider each area near the borg, looking for a good spot to hide */
+				for (o_x = -1; o_x < 2; o_x++)
+				{
+					/* Resest Wall count */
+					wall_east = 0;
+
+					/* No N-S offset check when looking E-W */
+					o_y = 0;
+
+					for (i = 0; i < 25; i++)
+					{
+						borg_grid *ag;
+
+						/* Check grids near borg */
+						m_y = c_y + o_y + ey[i];
+						m_x = c_x + o_x + ex[i];
+
+						/* avoid screen edgeds */
+						if (!in_bounds_fully(m_y, m_x)) continue;
+
+						/* grid the grid */
+						ag = &borg_grids[m_y][m_x];
+
+						/* Certain grids must not be floor types */
+						if (e_array[i] == 0 && ((ag->feat == FEAT_NONE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* This is a good grid */
+							wall_east++;
+						}
+						if (e_array[i] == 1 && ((ag->feat <= FEAT_MORE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* A good wall would score 25. */
+							wall_east++;
+						}
+					}
+
+					/* If I found 25 grids, then that spot will work well */
+					if (wall_east == 25)
+					{
+						return (FALSE);
+					}
+				}
+
+				/* WEST -- Consider each area near the borg, looking for a good spot to hide */
+				for (o_x = -2; o_x < 1; o_x++)
+				{
+					/* Resest Wall count */
+					wall_west = 0;
+
+					/* No N-S offset check when looking E-W */
+					o_y = 0;
+
+					for (i = 0; i < 25; i++)
+					{
+						borg_grid *ag;
+
+						/* Check grids near borg */
+						m_y = c_y + o_y + wy[i];
+						m_x = c_x + o_x + wx[i];
+
+						/* avoid screen edgeds */
+						if (!in_bounds_fully(m_y, m_x)) continue;
+
+						/* grid the grid */
+						ag = &borg_grids[m_y][m_x];
+
+						/* Certain grids must not be floor types */
+						if (w_array[i] == 0 && ((ag->feat == FEAT_NONE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* This is a good grid */
+							wall_west++;
+						}
+						if (w_array[i] == 1 && ((ag->feat <= FEAT_MORE) ||
+							(ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_K) ||
+							(ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID)))
+						{
+							/* A good wall would score 25. */
+							wall_west++;
+						}
+					}
+
+					/* If I found 25 grids, then that spot will work well */
+					if (wall_west == 25)
+					{
+						return (FALSE);
+					}
+				}
+			} /* Checking for Stone to Mud Spell */
+
+			/* Everything check out, this is a good place to lure the summoner */
+			return (TRUE);
+
+		} /* Scan Monster List */
+
+	}
+	/* Not good */
+	return (FALSE);
+}
 
 
 /*
@@ -2481,8 +2900,6 @@ static bool borg_heal(int danger )
 
     int stats_needing_fix = 0;
 
-	bool rod_good = FALSE;
-
     hp_down = borg_skill[BI_MAXHP] - borg_skill[BI_CURHP];
 	pct_down = ((borg_skill[BI_MAXHP] - borg_skill[BI_CURHP]) * 100 / borg_skill[BI_MAXHP]);
 	clw_heal = ((borg_skill[BI_MAXHP] - borg_skill[BI_CURHP]) * 15 / 100);
@@ -2496,16 +2913,6 @@ static bool borg_heal(int danger )
 	if (ccw_heal < 30) ccw_heal = 30;
 	if (cmw_heal < 50) cmw_heal = 50;
 	if (heal_heal < 300) heal_heal = 300;
-
-
-
-	/* Quick check for rod success (used later on) */
-	if (borg_slot(TV_ROD, SV_ROD_HEALING) != -1)
-	{
-    	/* Reasonable chance of success */
-		if (borg_activate_failure(TV_ROD, SV_ROD_HEALING) < 500)	
-			rod_good = TRUE;
-	}
 
     /* when fighting Morgoth, we want the borg to use Life potion to fix his
      * stats.  So we need to add up the ones that are dropped.
@@ -2634,8 +3041,9 @@ static bool borg_heal(int danger )
 
     /* We generally try to conserve ez-heal pots */
     if ((borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED]) &&
-       ((hp_down >= 400) || (danger > borg_skill[BI_CURHP] *5 && hp_down > 100)) &&
-        borg_quaff_potion(SV_POTION_STAR_HEALING))
+       ((hp_down >= 400) || (danger > borg_skill[BI_CURHP] *5 && hp_down > 200)) &&
+        (borg_quaff_potion(SV_POTION_HEALING) ||
+        borg_quaff_potion(SV_POTION_STAR_HEALING)))
     {
         borg_note("# Fixing Confusion/Blind.");
         return (TRUE);
@@ -2656,6 +3064,9 @@ static bool borg_heal(int danger )
              (borg_skill[BI_CURHP] > 550 && borg_prayer_fail(3,5, 15)) ||  /* Holy Word */
              borg_prayer_fail(6, 2, 15) ||
              borg_prayer_fail(3, 2, 15) ||
+			 borg_activate_effect(EFF_HEAL1,FALSE) ||
+			 borg_activate_effect(EFF_HEAL2,FALSE) ||
+			 borg_activate_effect(EFF_HEAL3,FALSE) ||
              borg_quaff_potion(SV_POTION_LIFE) ||
              borg_zap_rod(SV_ROD_HEALING)))
         {
@@ -2738,12 +3149,12 @@ static bool borg_heal(int danger )
     /* Risky Borgs are less likely to heal in the fight */
     if (borg_plays_risky) chance += 5;
 
-    if (((pct_down <= 15 && chance < 98) ||
-        (pct_down >= 16 && pct_down <= 25 && chance < 95) ||
-        (pct_down >= 26 && pct_down <= 50 && chance < 80) ||
-        (pct_down >= 51 && pct_down <= 65 && chance < 50) ||
-        (pct_down >= 66 && pct_down <= 74 && chance < 25) ||
-        (pct_down >= 75 && chance < 1)) &&
+    if (((pct_down <= 15 && chance > 98) ||
+        (pct_down >= 16 && pct_down <= 25 && chance > 95) ||
+        (pct_down >= 26 && pct_down <= 50 && chance > 80) ||
+        (pct_down >= 51 && pct_down <= 65 && chance > 50) ||
+        (pct_down >= 66 && pct_down <= 74 && chance > 25) ||
+        (pct_down >= 75 && chance > 1)) &&
          (!borg_skill[BI_ISHEAVYSTUN] && !borg_skill[BI_ISSTUN] && !borg_skill[BI_ISPOISONED] && !borg_skill[BI_ISCUT]))
             return FALSE;
 
@@ -2785,12 +3196,30 @@ static bool borg_heal(int danger )
         return (TRUE);
     }
 
+    /* Cure Critical Wounds (6d10) */
+    if ( pct_down >= 50 && pct_down <= 55 &&
+         ((danger) < borg_skill[BI_CURHP] + ccw_heal) &&
+		 (ccw_heal > danger / 3) &&  /* No rope-a-doping */
+         (borg_prayer_fail(2, 2, allow_fail) ||
+          borg_prayer_fail(6, 0, allow_fail) ||
+          borg_activate_effect(EFF_CURE_CRITICAL, FALSE) ||
+          borg_quaff_potion(SV_POTION_CURE_CRITICAL)))
+    {
+        borg_note("# Healing Level 3.");
+        return (TRUE);
+    }
+
     /* Cure Mortal Wounds (8d10) */
-    if ( pct_down >= 50 && 
+    if ( pct_down >= 50 &&
          ((danger) < borg_skill[BI_CURHP] + cmw_heal) &&
 		 (cmw_heal > danger / 3) &&  /* No rope-a-doping */
-         (borg_prayer_fail(2, 7, allow_fail) ||
-          borg_prayer_fail(6, 1, allow_fail)))
+         (borg_activate_effect(EFF_HEAL1,FALSE) ||
+		  borg_activate_effect(EFF_HEAL2,FALSE) ||
+		  borg_activate_effect(EFF_HEAL3,FALSE) ||
+		  borg_zap_rod(SV_ROD_HEALING) ||
+		  borg_prayer_fail(2, 7, allow_fail) ||
+          borg_prayer_fail(6, 1, allow_fail) ||
+		  borg_quaff_potion(SV_POTION_CURE_CRITICAL)))
     {
         borg_note("# Healing Level 4.");
         return (TRUE);
@@ -2801,7 +3230,7 @@ static bool borg_heal(int danger )
         danger < borg_skill[BI_MAXHP] &&
         borg_skill[BI_CURHP] < 50 &&
         danger < ccw_heal &&
-        borg_quaff_crit(TRUE))
+        borg_quaff_potion(SV_POTION_CURE_CRITICAL))
     {
         borg_note("# Healing Level 5.");
         return (TRUE);
@@ -2809,12 +3238,12 @@ static bool borg_heal(int danger )
 
 
     /* Heal step one (200hp) */
-    if (pct_down >= 55 && 
+    if (pct_down >= 55 &&
         danger < borg_skill[BI_CURHP] + heal_heal &&
-        ( (((!borg_skill[BI_ATELEPORT] && !borg_skill[BI_AESCAPE]) || rod_good ) &&
-          borg_zap_rod(SV_ROD_HEALING)) ||
-         borg_activate_artifact(EFF_HEAL1,INVEN_BODY) ||
-         borg_activate_artifact(EFF_HEAL2,INVEN_HEAD) ||
+        (borg_activate_effect(EFF_HEAL1,FALSE) ||
+         borg_activate_effect(EFF_HEAL2,FALSE) ||
+         borg_activate_effect(EFF_HEAL3,FALSE) ||
+         borg_zap_rod(SV_ROD_HEALING) ||
          borg_use_staff_fail(SV_STAFF_HEALING) ||
          borg_prayer_fail(3, 2, allow_fail)))
     {
@@ -2840,10 +3269,11 @@ static bool borg_heal(int danger )
         (borg_use_staff_fail(SV_STAFF_HEALING) ||
          (borg_fighting_evil_unique && borg_prayer_fail(3,5, allow_fail)) || /* holy word */
          borg_prayer_fail(3, 2, allow_fail) ||
-         (((!borg_skill[BI_ATELEPORT] && !borg_skill[BI_AESCAPE]) || rod_good ) &&
-          borg_zap_rod(SV_ROD_HEALING)) ||
-         borg_zap_rod(SV_ROD_HEALING) ||
-         borg_quaff_potion(SV_POTION_HEALING) ))
+         borg_activate_effect(EFF_HEAL1,FALSE) ||
+         borg_activate_effect(EFF_HEAL2,FALSE) ||
+         borg_activate_effect(EFF_HEAL3,FALSE) ||
+		 borg_zap_rod(SV_ROD_HEALING) ||
+		 borg_quaff_potion(SV_POTION_HEALING) ))
     {
         borg_note("# Healing Level 7.");
         return (TRUE);
@@ -2853,14 +3283,14 @@ static bool borg_heal(int danger )
     if (pct_down > 60 &&
         danger < borg_skill[BI_CURHP]+ heal_heal &&
         ((borg_fighting_evil_unique && borg_prayer_fail(3,5, allow_fail)) || /* holy word */
-         (((!borg_skill[BI_ATELEPORT] && !borg_skill[BI_AESCAPE]) || rod_good)  &&
-           borg_zap_rod(SV_ROD_HEALING)) ||
          borg_prayer_fail(6, 2, allow_fail) ||
          borg_prayer_fail(3, 2, allow_fail) ||
          borg_use_staff_fail(SV_STAFF_HEALING) ||
          borg_quaff_potion(SV_POTION_HEALING) ||
-         borg_activate_artifact(EFF_HEAL1,INVEN_BODY) ||
-         borg_activate_artifact(EFF_HEAL2,INVEN_HEAD)) )
+         borg_activate_effect(EFF_HEAL1,FALSE) ||
+         borg_activate_effect(EFF_HEAL2,FALSE) ||
+         borg_activate_effect(EFF_HEAL3,FALSE) ||
+         borg_zap_rod(SV_ROD_HEALING)) )
     {
          borg_note("# Healing Level 8.");
         return (TRUE);
@@ -2873,11 +3303,11 @@ static bool borg_heal(int danger )
          borg_prayer_fail(6, 2, allow_fail) ||
          borg_prayer_fail(3, 2, allow_fail) ||
          borg_use_staff_fail(SV_STAFF_HEALING) ||
-         (((!borg_skill[BI_ATELEPORT] && !borg_skill[BI_AESCAPE]) || rod_good) &&
-          borg_zap_rod(SV_ROD_HEALING)) ||
          borg_quaff_potion(SV_POTION_HEALING) ||
          borg_activate_artifact(EFF_HEAL1,INVEN_BODY) ||
          borg_activate_artifact(EFF_HEAL2,INVEN_HEAD) ||
+         borg_activate_artifact(EFF_HEAL3,INVEN_HEAD) ||
+         borg_zap_rod(SV_ROD_HEALING) ||
          (borg_fighting_unique &&
           (borg_quaff_potion(SV_POTION_STAR_HEALING) ||
            borg_quaff_potion(SV_POTION_HEALING) ||
@@ -3349,6 +3779,10 @@ bool borg_caution(void)
         {
             borg_note("# Protected by Mystic Shield");
         }
+        if (borg_stone)
+        {
+            borg_note("# Protected by Stoneskin");
+        }
         if (borg_prot_from_evil)
         {
             borg_note("# Protected by PFE");
@@ -3478,7 +3912,7 @@ bool borg_caution(void)
         if ((!borg_speed && borg_spell_fail(3, 2,15)) ||
             (borg_skill[BI_TRFIRE] + borg_skill[BI_TRCOLD] + borg_skill[BI_TRACID] +
              borg_skill[BI_TRELEC] + borg_skill[BI_TRPOIS] < 3 && borg_spell_fail(4,3,15)) ||
-            (!borg_shield && borg_spell_fail(4,4,15)) ||
+            ((!borg_shield && !borg_stone) && borg_spell_fail(4,4,15)) ||
             (!borg_hero && borg_spell_fail(7,0,15)) ||
             (!borg_berserk && borg_spell_fail(7,1,15)))
         {
@@ -3644,7 +4078,7 @@ bool borg_caution(void)
         		   ((!borg_speed && borg_spell_fail(3, 2,15)) ||
         		    (borg_skill[BI_TRFIRE] + borg_skill[BI_TRCOLD] + borg_skill[BI_TRACID] +
         		      borg_skill[BI_TRELEC] + borg_skill[BI_TRPOIS] < 3 && borg_spell_fail(4,3,15)) ||
-        		    (!borg_shield && borg_spell_fail(4,4,15)) ||
+        		    ((!borg_shield && !borg_stone) && borg_spell_fail(4,4,15)) ||
         		    (!borg_hero && borg_spell_fail(7,0,15)) ||
         		    (!borg_berserk && borg_spell_fail(7,1,15)))))
         		{
@@ -3938,6 +4372,7 @@ bool borg_caution(void)
         int b_x = c_x;
         int b_y = c_y;
 		int ii;
+		bool fast_kill = FALSE;
 
         /* Scan the useful viewable grids */
         for (j = 1; j < borg_view_n; j++)
@@ -4080,11 +4515,22 @@ bool borg_caution(void)
 						if (kill->when < borg_t - 2) continue;
 
 						/* Check distance -- 1 grid away */
-						if (distance(kill->y, kill->x, y1, x1) <= 1 &&
-							kill->speed > borg_skill[BI_SPEED] && !borg_surround) break;
+						if (distance(kill->y, kill->x, y1, x1) <= 2 &&
+							kill->speed > borg_skill[BI_SPEED] && !borg_surround)
+						{
+							fast_kill = TRUE;
+							break;
+						}
 					}
                 }
 
+
+				/* Speedy monster */
+				if (fast_kill)
+				{
+					b_r = -1;
+					break;
+				}
 
                 /* Skip monsters */
                 if (ag->kill) break;
@@ -4703,6 +5149,8 @@ static int borg_thrust_damage_one(int i)
 {
     int dam;
     int mult;
+	int bonus;
+	int loop;
 
     borg_kill *kill;
 
@@ -4710,7 +5158,7 @@ static int borg_thrust_damage_one(int i)
 
     borg_item *item;
 
-    int chance;
+    int chance = 0;
 
     /* Examine current weapon */
     item = &borg_items[INVEN_WIELD];
@@ -4760,10 +5208,13 @@ static int borg_thrust_damage_one(int i)
     dam *= borg_skill[BI_BLOWS];
 
 	/* Bonuses for combat */
-	chance = (borg_skill[BI_THN] + ((borg_skill[BI_TOHIT] + item->to_h) * 3));
+	bonus = (borg_skill[BI_THN] + ((borg_skill[BI_TOHIT] + item->to_h) * BTH_PLUS_ADJ));
 
 	/* Chance of hitting the monsters AC */
-	if (chance < (r_ptr->ac * 3/4) * 8/10) dam = 0;
+	for (loop = 1; loop < 100; loop++)
+	{
+		if ((bonus * loop) / 100 >= (r_ptr->ac * 3/4)) chance++;
+	}
 
     /* 5% automatic success/fail */
     if (chance > 95) chance = 95;
@@ -4797,6 +5248,8 @@ static int borg_thrust_damage_one(int i)
      *
      */
     if ((rf_has(r_ptr->flags, RF_UNIQUE)) && borg_skill[BI_CDEPTH] >=1) dam += (dam * 5);
+    if ((rf_has(r_ptr->flags, RF_UNIQUE)) && borg_skill[BI_CDEPTH] >=1 &&
+		kill->injury > 80) dam += (dam * 99);
 
     /* Hack -- ignore Maggot until later.  Player will chase Maggot
      * down all accross the screen waking up all the monsters.  Then
@@ -5101,7 +5554,8 @@ bool borg_target_unknown_wall(int y, int x)
         }
 
 		/* Pathway found the target. */
-        if (n_x == x && n_y == y)
+        if (borg_grids[n_y][n_x].feat == FEAT_NONE &&
+            n_x == x && n_y == y)
 		{
 			/* end of the pathway */
 			mmove2(&n_y, &n_x, y, x, c_y, c_x);
@@ -5341,34 +5795,34 @@ int borg_launch_damage_one(int i, int dam, int typ, int ammo_location)
 
         /* Acid */
         case GF_ACID:
-        if (rf_has(r_ptr->flags, RF_IM_ACID)) dam = 0;
+        if (rf_has(r_ptr->flags, RF_IM_ACID)) dam /= 9;
         break;
 
         /* Electricity */
         case GF_ELEC:
-        if (rf_has(r_ptr->flags, RF_IM_ELEC)) dam = 0;
+        if (rf_has(r_ptr->flags, RF_IM_ELEC)) dam /= 9;
         break;
 
         /* Fire damage */
         case GF_FIRE:
-        if (rf_has(r_ptr->flags, RF_IM_FIRE)) dam = 0;
+        if (rf_has(r_ptr->flags, RF_IM_FIRE)) dam /= 9;
         if ((rf_has(r_ptr->flags, RF_HURT_FIRE))) dam *= 2;
         break;
 
         /* Cold */
         case GF_COLD:
-        if (rf_has(r_ptr->flags, RF_IM_COLD)) dam = 0;
+        if (rf_has(r_ptr->flags, RF_IM_COLD)) dam /= 9;
         if (rf_has(r_ptr->flags, RF_HURT_COLD)) dam *= 2;
         break;
 
         /* Poison */
         case GF_POIS:
-        if (rf_has(r_ptr->flags, RF_IM_POIS)) dam = 0;
+        if (rf_has(r_ptr->flags, RF_IM_POIS)) dam /= 9;
         break;
 
         /* Ice */
         case GF_ICE:
-        if (rf_has(r_ptr->flags, RF_IM_COLD)) dam = 0;
+        if (rf_has(r_ptr->flags, RF_IM_COLD)) dam /= 9;
         break;
 
 
@@ -5897,6 +6351,8 @@ int borg_launch_damage_one(int i, int dam, int typ, int ammo_location)
     /* this should be just enough to give prefrence to wacking uniques */
     if ((rf_has(r_ptr->flags, RF_UNIQUE)) && borg_skill[BI_CDEPTH] >=1)
         dam = (dam * 3);
+    if ((rf_has(r_ptr->flags, RF_UNIQUE)) && borg_skill[BI_CDEPTH] >=1 &&
+		kill->injury > 80) dam += (dam * 99);
 
     /* Hack -- ignore Maggot until later.  Player will chase Maggot
      * down all accross the screen waking up all the monsters.  Then
@@ -6104,6 +6560,11 @@ static int borg_launch_bolt_aux(int y, int x, int rad, int dam, int typ, int max
 
     int r, n;
 
+	/* Number of grids in the "path" */
+	int path_n = 0;
+	u16b path_g[512];
+	int flg = PROJECT_BEAM | PROJECT_KILL | PROJECT_THRU;
+
     borg_grid *ag;
     monster_race *r_ptr;
     borg_kill *kill;
@@ -6123,8 +6584,20 @@ static int borg_launch_bolt_aux(int y, int x, int rad, int dam, int typ, int max
     /* Initial location */
     x1 = c_x; y1 = c_y;
 
-    /* Final location */
-    x2 = x; y2 = y;
+    /* Final location for beams, bolts and balls */
+    if (rad == -1)
+	{
+		path_n = borg_project_path(path_g, MAX_RANGE, c_y, c_x, y, x, flg);
+
+		/* Redefine the target to the be end of the projection beam */
+		y2 = GRID_Y(path_g[path_n-1]);
+		x2 = GRID_X(path_g[path_n-1]);
+	}
+	else
+	{
+		/* Final location for bolts and balls */
+		x2 = x; y2 = y;
+	}
 
     /* Start over */
     x = x1; y = y1;
@@ -6580,6 +7053,49 @@ static int borg_launch_bolt(int rad, int dam, int typ, int max, int ammo_locatio
     return (b_n);
 }
 
+
+/*
+ * Simulate/Apply the optimal result of launching a dispel attack
+ *
+ *  dispel spells have a rad  of 10
+ */
+static int borg_launch_dispel(int rad, int dam, int typ, int max, int ammo_location)
+{
+    int i=0;
+    int n = 0;
+
+    /* Examine the monsters */
+    for (i = 0; i < borg_temp_n; i++)
+    {
+        int x = borg_temp_x[i];
+        int y = borg_temp_y[i];
+
+        /* Acquire location */
+        x = borg_temp_x[i];
+        y = borg_temp_y[i];
+
+		/* Bounds check */
+		if (!in_bounds(y,x)) continue;
+
+		/* Skip places that are out of range */
+		if (distance(c_y, c_x, y, x) > max) continue;
+
+		/* Can it be seen/hit */
+		if (!borg_projectable(c_y, c_x, y, x)) continue;
+
+		/* Consider it  (look at visability here as well) */
+        n += borg_launch_bolt_aux_hack(borg_grids[y][x].kill, dam, typ, ammo_location);
+    }
+
+	/* Reset Teleport Other variables */
+	borg_tp_other_n = 0;
+
+    /* Simulation */
+    if (borg_simulate) return (n);
+
+    /* Result */
+    return (n);
+}
 
 
 
@@ -8370,7 +8886,7 @@ static int borg_attack_aux_prayer_dispel(int book, int what, int dam, int typ)
     if (!borg_prayer_okay_fail(book, what, 25)) return (0);
 
     /* Choose optimal location--radius defined as 10 */
-    b_n = borg_launch_bolt(10, dam, typ, MAX_RANGE, 0);
+    b_n = borg_launch_dispel(10, dam, typ, MAX_RANGE, 0);
 
     /* Penalize mana usage */
     b_n = b_n - as->power;
@@ -8427,7 +8943,7 @@ static int borg_attack_aux_spell_dispel(int book, int what, int dam, int typ)
     if (!borg_spell_okay_fail(book, what, 25)) return (0);
 
     /* Choose optimal location--radius defined as 10 */
-    b_n = borg_launch_bolt(10, dam, typ, MAX_RANGE, 0);
+    b_n = borg_launch_dispel(10, dam, typ, MAX_RANGE, 0);
 
     /* Penalize mana usage */
     b_n = b_n - as->power;
@@ -8480,7 +8996,7 @@ static int borg_attack_aux_staff_dispel(int sval, int rad, int dam, int typ)
     if (!borg_equips_staff_fail(sval)) return (0);
 
     /* Choose optimal location--radius defined as 10 */
-    b_n = borg_launch_bolt(10, dam, typ, MAX_RANGE, 0);
+    b_n = borg_launch_dispel(10, dam, typ, MAX_RANGE, 0);
 
     /* Big Penalize charge usage */
     b_n = b_n - 50;
@@ -10215,6 +10731,11 @@ static void borg_log_spellpath(bool beam)
 
 	int dist = 0;
 
+	/* Number of grids in the "path" */
+	int path_n = 0;
+	u16b path_g[512];
+	int flg = PROJECT_BEAM | PROJECT_KILL | PROJECT_THRU;
+
     borg_grid *ag;
     borg_kill *kill;
 
@@ -10222,6 +10743,12 @@ static void borg_log_spellpath(bool beam)
 	x = borg_target_x;
 	n_x = c_x;
 	n_y = c_y;
+
+	path_n = borg_project_path(path_g, MAX_RANGE, c_y, c_x, y, x, flg);
+
+	/* Redefine the target to the be end of the projection beam */
+	y = GRID_Y(path_g[path_n-1]);
+	x = GRID_X(path_g[path_n-1]);
 
     while (1)
     {
@@ -10322,7 +10849,6 @@ enum
 static int borg_defend_aux_bless( int p1 )
 {
     int fail_allowed = 25;
-    borg_grid *ag = &borg_grids[c_y][c_x];
 
 	int i;
 
@@ -10332,19 +10858,12 @@ static int borg_defend_aux_bless( int p1 )
     if (borg_bless)
         return (0);
 
-    /* Cant when Blind */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
-    /* Dark */
-    if (!(ag->info & BORG_GLOW) && borg_skill[BI_CURLITE] == 0) return (0);
-
-
     /* no spell */
     if ( !borg_prayer_okay_fail(0, 2, fail_allowed) &&
          !borg_prayer_okay_fail(3, 0, fail_allowed) &&
-         -1 == borg_slot(TV_SCROLL, SV_SCROLL_BLESSING) &&
-         -1 == borg_slot(TV_SCROLL, SV_SCROLL_HOLY_CHANT) &&
-         -1 == borg_slot(TV_SCROLL, SV_SCROLL_HOLY_PRAYER))
+         !borg_equips_item(TV_SCROLL, SV_SCROLL_BLESSING) &&
+         !borg_equips_item(TV_SCROLL, SV_SCROLL_HOLY_CHANT) &&
+         !borg_equips_item(TV_SCROLL, SV_SCROLL_HOLY_PRAYER))
         return (0);
 
 	/* Check if a monster is close to me .
@@ -10409,8 +10928,6 @@ static int borg_defend_aux_speed( int p1 )
     if (borg_speed)
         return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
@@ -10437,7 +10954,7 @@ static int borg_defend_aux_speed( int p1 )
         speed_rod = TRUE;
 
 	/* Need some form */
-    if (0 > borg_slot(TV_POTION, SV_POTION_SPEED) &&
+    if (!borg_equips_item(TV_POTION, SV_POTION_SPEED) &&
         !speed_staff &&
         !speed_rod &&
         !speed_spell &&
@@ -10551,15 +11068,6 @@ static int borg_defend_aux_resist_fc( int p1 )
         borg_skill[BI_TRCOLD])
         return (0);
 
-#if 0
-        if (borg_skill[BI_RFIRE] &&
-        borg_skill[BI_RCOLD])
-        return (0);
-#endif
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
         fail_allowed -= 19;
@@ -10645,9 +11153,6 @@ static int borg_defend_aux_resist_fecap( int p1)
         borg_skill[BI_TRELEC] &&
         borg_skill[BI_TRCOLD])
         return (0);
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
@@ -10743,9 +11248,6 @@ static int borg_defend_aux_resist_f( int p1 )
     if (borg_skill[BI_TRFIRE])
         return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
         fail_allowed -= 19;
@@ -10761,7 +11263,7 @@ static int borg_defend_aux_resist_f( int p1 )
     if (!borg_spell_okay_fail(4, 1, fail_allowed) &&
         !borg_equips_artifact(EFF_RESIST_ALL, INVEN_OUTER) &&
         !borg_equips_ring(SV_RING_FLAMES) &&
-        -1 == borg_slot(TV_POTION, SV_POTION_RESIST_HEAT))
+        !borg_equips_item(TV_POTION, SV_POTION_RESIST_HEAT))
         return (0);
 
     /* elemental and PFE use the 'averaging' method for danger.  Redefine p1 as such. */
@@ -10827,9 +11329,6 @@ static int borg_defend_aux_resist_c( int p1 )
     if ( borg_skill[BI_TRCOLD] )
         return (0);
 
-	/* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
     /* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
         fail_allowed -= 19;
@@ -10845,7 +11344,7 @@ static int borg_defend_aux_resist_c( int p1 )
     if (!borg_spell_okay_fail(4, 0, fail_allowed) &&
         !borg_equips_artifact(EFF_RESIST_ALL, INVEN_OUTER) &&
         !borg_equips_ring(SV_RING_ICE) &&
-        -1 == borg_slot(TV_POTION, SV_POTION_RESIST_COLD))
+        !borg_equips_item(TV_POTION, SV_POTION_RESIST_COLD))
         return (0);
 
     /* elemental and PFE use the 'averaging' method for danger.  Redefine p1 as such. */
@@ -10912,9 +11411,6 @@ static int borg_defend_aux_resist_a( int p1 )
 
     if (borg_skill[BI_TRACID])
         return (0);
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
@@ -10988,9 +11484,6 @@ static int borg_defend_aux_resist_p( int p1 )
     if (borg_skill[BI_TRPOIS])
         return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
         fail_allowed -= 19;
@@ -11046,16 +11539,11 @@ static int borg_defend_aux_prot_evil( int p1)
 {
     int p2 = 0;
     int fail_allowed = 25;
-    bool pfe_spell = FALSE;
-    borg_grid *ag = &borg_grids[c_y][c_x];
 
 
     /* if already protected */
     if (borg_prot_from_evil)
         return (0);
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
@@ -11069,18 +11557,9 @@ static int borg_defend_aux_prot_evil( int p1)
     if ( p1 < avoidance/3)
         fail_allowed += 10;
 
-    if (borg_prayer_okay_fail(2,4,fail_allowed)) pfe_spell= TRUE;
-
-    if ( 0 <= borg_slot(TV_SCROLL,SV_SCROLL_PROTECTION_FROM_EVIL)) pfe_spell = TRUE;
-
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISIMAGE])
-        pfe_spell = FALSE;
-
-    if (!(ag->info & BORG_GLOW) && borg_skill[BI_CURLITE] == 0) pfe_spell = FALSE;
-
-    if (borg_equips_artifact(EFF_PROTEVIL,INVEN_NECK)) pfe_spell = TRUE;
-
-    if (pfe_spell == FALSE) return (0);
+    if (!borg_prayer_okay_fail(2,4,fail_allowed) &&
+		!borg_equips_item(TV_SCROLL,SV_SCROLL_PROTECTION_FROM_EVIL) &&
+		!borg_equips_artifact(EFF_PROTEVIL,INVEN_NECK)) return (0);
 
     /* elemental and PFE use the 'averaging' method for danger.  Redefine p1 as such. */
     p1 = borg_danger(c_y, c_x, 1, FALSE, FALSE);
@@ -11125,11 +11604,8 @@ static int borg_defend_aux_shield( int p1)
     int fail_allowed = 25;
 
     /* if already protected */
-    if (borg_shield)
+    if (borg_shield || borg_stone)
         return (0);
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance)
@@ -11192,24 +11668,27 @@ static int borg_defend_aux_tele_away( int p1)
     int i, x, y;
 
     borg_grid *ag;
+    monster_race *r_ptr;
 
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/*
      * Only tport monster away if scared or getting low on mana
      */
     if (borg_fighting_unique)
 	{
-		if (p1 < avoidance * 7/10 && borg_skill[BI_CURSP] > 30 && borg_simulate)
+		if (p1 < avoidance && (borg_skill[BI_MAXSP] >= 1 && borg_skill[BI_CURSP] > 30) && borg_simulate)
+			return (0);
+		else if (p1 < avoidance && borg_skill[BI_MAXSP] == 0 && borg_simulate) /* Warriors */
 			return (0);
 	}
 	else
 	{
-		if (p1 < avoidance * 5/10 && borg_skill[BI_CURSP] > 30 && borg_simulate)
+		if (p1 < avoidance * 8/10 && (borg_skill[BI_MAXSP] >= 1 && borg_skill[BI_CURSP] > 30) && borg_simulate)
+			return (0);
+		else if (p1 < avoidance * 8/10 && borg_skill[BI_MAXSP] == 0 && borg_simulate) /* Warriors */
 			return (0);
 	}
+
 
 	/* No real Danger to speak of */
 	if (p1 < avoidance * 4 / 10 && borg_simulate) return (0);
@@ -11232,8 +11711,8 @@ static int borg_defend_aux_tele_away( int p1)
     if (borg_spell_okay_fail(3, 1, fail_allowed) ||
         borg_prayer_okay_fail(4, 2, fail_allowed) ||
         borg_equips_artifact(EFF_TELE_OTHER, INVEN_WIELD) ||
-        ( -1 != borg_slot(TV_WAND, SV_WAND_TELEPORT_AWAY) &&
-         borg_items[borg_slot(TV_WAND, SV_WAND_TELEPORT_AWAY)].pval))
+		borg_equips_rod(SV_ROD_TELEPORT_OTHER) ||
+		borg_equips_item(TV_WAND, SV_WAND_TELEPORT_AWAY))
          spell_ok = TRUE;
 
     if (!spell_ok) return (0);
@@ -11268,6 +11747,7 @@ static int borg_defend_aux_tele_away( int p1)
 
         /* Monster */
         kill = &borg_kills[i];
+        r_ptr = &r_info[kill->r_idx];
 
         /* Skip dead monsters */
         if (!kill->r_idx) continue;
@@ -11289,6 +11769,9 @@ static int borg_defend_aux_tele_away( int p1)
         if (!(ag->info & BORG_VIEW)) continue;
 		if ((ag->feat >= FEAT_RUBBLE) &&
 			(ag->feat <= FEAT_PERM_SOLID)) continue;
+
+		/* Skip Morgoth.  The borg is all in when it comes to M */
+        if (rf_has(r_ptr->flags, RF_QUESTOR)) continue;
 
         /* Check the distance XXX XXX XXX */
         if (distance(c_y, c_x, y, x) > MAX_RANGE) continue;
@@ -11376,11 +11859,8 @@ static int borg_defend_aux_hero( int p1 )
     if (borg_hero)
         return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	if ( !borg_spell_okay_fail(7, 0, fail_allowed ) &&
-         -1 == borg_slot(TV_POTION, SV_POTION_HEROISM))
+         !borg_equips_item(TV_POTION, SV_POTION_HEROISM))
         return (0);
 
     /* if we are in some danger but not much, go for a quick bless */
@@ -11418,11 +11898,8 @@ static int borg_defend_aux_berserk( int p1 )
     if (borg_berserk)
         return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	if (!borg_spell_okay_fail(7, 1, fail_allowed ) &&
-        -1 == borg_slot(TV_POTION, SV_POTION_BERSERK_STRENGTH) &&
+        !borg_equips_item(TV_POTION, SV_POTION_BERSERK_STRENGTH) &&
         !borg_equips_artifact(EFF_BERSERKER, INVEN_WIELD))
         return (0);
 
@@ -11449,12 +11926,8 @@ static int borg_defend_aux_glyph( int p1)
 {
     int p2 = 0, i;
     int fail_allowed = 25;
-    bool glyph_spell = FALSE;
 
     borg_grid *ag = &borg_grids[c_y][c_x];
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* He should not cast it while on an object.
      * I have addressed this inadequately in borg9.c when dealing with
@@ -11490,17 +11963,9 @@ static int borg_defend_aux_glyph( int p1)
     if ( p1 < avoidance/3)
         fail_allowed += 20;
 
-    if (borg_prayer_okay_fail(3,4,fail_allowed)) glyph_spell = TRUE;
-    if (borg_spell_okay_fail(6,4,fail_allowed)) glyph_spell = TRUE;
-
-    if ( 0 <= borg_slot(TV_SCROLL,SV_SCROLL_RUNE_OF_PROTECTION)) glyph_spell = TRUE;
-
-    if ((borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISIMAGE]) && glyph_spell)
-        glyph_spell = FALSE;
-
-    if (!(ag->info & BORG_GLOW) && borg_skill[BI_CURLITE] == 0) glyph_spell = FALSE;
-
-    if (!glyph_spell) return (0);
+    if (!borg_prayer_okay_fail(3,4,fail_allowed) &&
+        !borg_spell_okay_fail(6,4,fail_allowed) &&
+		!borg_equips_item(TV_SCROLL,SV_SCROLL_RUNE_OF_PROTECTION)) return (0);
 
     /* pretend we are protected and look again */
     borg_on_glyph = TRUE;
@@ -11556,9 +12021,6 @@ static int borg_defend_aux_create_door( int p1)
 
     borg_grid *ag;
 
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* any summoners near?*/
     if (!borg_fighting_summoner) return (0);
@@ -11663,9 +12125,6 @@ static int borg_defend_aux_mass_genocide(int p1)
 
     borg_kill *kill;
     monster_race *r_ptr;
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* see if prayer is legal */
     if (!borg_spell_okay_fail(8, 5, 40) &&
@@ -11800,9 +12259,6 @@ static int borg_defend_aux_genocide(int p1)
     /* not very scary, allow lots of fail */
     if ( p1 < avoidance/3)
         fail_allowed += 10;
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* Normalize the p1 value.  It contains danger added from
 	 * regional fear and monster fear.  Which wont be counted
@@ -12042,9 +12498,6 @@ static int borg_defend_aux_genocide_nasties(int p1)
     /* only do it when Hounds start to show up, */
     if (borg_skill[BI_CDEPTH] < 25) return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* Do not perform in Danger */
     if (p1 > avoidance / 4)
         return (0);
@@ -12129,9 +12582,6 @@ static int borg_defend_aux_earthquake(int p1)
 		return (p2);
 	}
 
-	/* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* Can I cast the spell? */
     if (!borg_prayer_okay_fail(2, 5, 35) &&
         !borg_spell_okay_fail(8, 0, 35))
@@ -12180,9 +12630,6 @@ static int borg_defend_aux_destruction(int p1)
     int d = 0;
     bool spell= FALSE;
 	bool real_danger = FALSE;
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* Cast the spell */
 	if (!borg_simulate)
@@ -12280,9 +12727,6 @@ static int borg_defend_aux_teleportlevel( int p1)
     	}
 	}
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* See if he is in real danger */
     if (p1 < avoidance * 2)
         return (0);
@@ -12340,9 +12784,6 @@ static int borg_defend_aux_banishment( int p1)
     /* if very scary, do not allow for much chance of fail */
     if ( p1 > avoidance * 4)
         fail_allowed -= 10;
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	if (!borg_prayer_okay_fail(8, 2, fail_allowed))
         return (0);
@@ -12503,8 +12944,7 @@ static int borg_defend_aux_inviso(int p1)
 
 
     /* no need */
-	if (borg_skill[BI_ISFORGET] || borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_see_inv)
-        return (0);
+	if (borg_see_inv) return (0);
 
     /* not recent */
     if (borg_t > need_see_inviso + 5) return (0);
@@ -12514,8 +12954,8 @@ static int borg_defend_aux_inviso(int p1)
     if (p1 > avoidance * 2) return (0);
 
     /* Do I have anything that will work? */
-    if (-1 == borg_slot(TV_POTION,SV_POTION_DETECT_INVIS)  &&
-        -1 == borg_slot(TV_SCROLL,SV_SCROLL_DETECT_INVIS) &&
+    if (!borg_equips_item(TV_POTION,SV_POTION_DETECT_INVIS)  &&
+        !borg_equips_item(TV_SCROLL,SV_SCROLL_DETECT_INVIS) &&
         !borg_equips_staff_fail(SV_STAFF_DETECT_INVIS) &&
         !borg_equips_staff_fail(SV_STAFF_DETECT_EVIL) &&
         !borg_prayer_okay_fail(2, 3, fail_allowed) &&
@@ -12572,9 +13012,6 @@ static int borg_defend_aux_lbeam(void)
     int x=c_x;
     int y=c_y;
 
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
     /* Light Beam section to spot non seen guys */
         /* not recent, dont bother */
@@ -12644,10 +13081,25 @@ static int borg_defend_aux_lbeam(void)
 static int borg_defend_aux_panel_shift(void)
 {
     int dir=0;
-    int wx = Term->offset_x / PANEL_WID;
-    int wy = Term->offset_y / PANEL_HGT;
+    int wx = Term->offset_x;
+    int wy = Term->offset_y;
+	int screen_hgt, screen_wid;
+	int new_wy = wy;
+	int new_wx = wx;
+	int panel_wid, panel_hgt;
 
-    /* no need */
+	int py = c_y;
+	int px = c_x;
+
+
+	screen_hgt = SCREEN_HGT;
+	screen_wid = SCREEN_WID;
+
+	panel_wid = screen_wid / 2;
+	panel_hgt = screen_hgt / 2;
+
+
+	/* no need */
     if (!need_shift_panel && borg_skill[BI_CDEPTH] < 70)
         return (0);
 
@@ -12655,30 +13107,37 @@ static int borg_defend_aux_panel_shift(void)
 	if (borg_skill[BI_CDEPTH] == 100 && w_y == morgy_panel_y &&
 		w_x == morgy_panel_x) return (0);
 
-    /* Which direction do we need to move? */
-    /* Shift panel to the right */
-    if (c_x >= 52 && c_x <= 60 && wx == 0) dir = 6;
-    if (c_x >= 84 && c_x <= 94 && wx == 1) dir = 6;
-    if (c_x >= 116 && c_x <= 123 && wx == 2) dir = 6;
-    if (c_x >= 148 && c_x <= 159 && wx == 3) dir = 6;
-    /* Shift panel to the left */
-    if (c_x <= 142 && c_x >= 136 && wx == 4) dir = 4;
-    if (c_x <= 110 && c_x >= 103 && wx == 3) dir = 4;
-    if (c_x <= 78 && c_x >= 70 && wx == 2) dir = 4;
-    if (c_x <= 46 && c_x >= 37 && wx == 1) dir = 4;
+	/* Scroll screen vertically when x grids from top/bottom edge */
+	if ((py < wy + 6) || (py >= wy + screen_hgt - 6))
+			new_wy = py - panel_hgt;
 
-    /* Shift panel down */
-    if (c_y >= 15 && c_y <= 19 && wy == 0) dir = 2;
-    if (c_y >= 25 && c_y <= 30 && wy == 1) dir = 2;
-    if (c_y >= 36 && c_y <= 41 && wy == 2) dir = 2;
-    if (c_y >= 48 && c_y <= 52 && wy == 3) dir = 2;
-    /* Shift panel up */
-    if (c_y <= 51 && c_y >= 47 && wy == 4) dir = 8;
-    if (c_y <= 39 && c_y >= 35 && wy == 3) dir = 8;
-    if (c_y <= 28 && c_y >= 24 && wy == 2) dir = 8;
-    if (c_y <= 17 && c_y >= 13 && wy == 1) dir = 8;
 
-    /* Do the Shift if needed, then note it,  reset the flag */
+	/* Scroll screen horizontally when x grids from left/right edge */
+	if ((px < wx + 6) || (px >= wx + screen_wid - 6))
+			new_wx = px - panel_wid;
+
+
+	/* Verify wy, adjust if needed */
+	if (new_wy > DUNGEON_HGT - SCREEN_HGT) new_wy = DUNGEON_HGT - SCREEN_HGT;
+	if (new_wy < 0) new_wy = 0;
+
+	/* Verify wx, adjust if needed */
+	if (new_wx > DUNGEON_WID - SCREEN_WID) new_wx = DUNGEON_WID - SCREEN_WID;
+	if (new_wx < 0) new_wx = 0;
+
+
+	/* Determine the direction of shift */
+	if (new_wx > wx && new_wy == wy) dir = 6;
+	if (new_wx < wx && new_wy == wy) dir = 4;
+	if (new_wy > wy && new_wx == wx) dir = 2;
+	if (new_wy < wy && new_wx == wx) dir = 8;
+
+	if (new_wx > wx && new_wy > wy) dir = 3;
+	if (new_wx > wx && new_wy < wy) dir = 9;
+	if (new_wx < wx && new_wy > wy) dir = 1;
+	if (new_wx < wx && new_wy < wy) dir = 7;
+
+	/* Do the Shift if needed, then note it,  reset the flag */
     if (need_shift_panel == TRUE)
     {
         /* Send action (view panel info) */
@@ -12693,7 +13152,7 @@ static int borg_defend_aux_panel_shift(void)
        	/* Leave the panel shift mode */
        	borg_keypress(ESCAPE);
     }
-    else
+    else if (dir != 0)
     /* check to make sure its appropriate */
     {
 
@@ -12706,59 +13165,91 @@ static int borg_defend_aux_panel_shift(void)
         }
         else
         /* shift up? only if a north corridor */
-        if (dir == 8 && borg_projectable_pure(c_y,c_x, c_y-2, c_x) &&
-            track_step_y[track_step_num -1] != c_y - 1)
-        {
-            /* Send action (view panel info) */
-            borg_keypress('L');
-            if (dir) borg_keypress(I2D(dir));
-            borg_note("# Shifted panel as a precaution.");
-            /* Mark the time to avoid loops */
-            when_shift_panel = borg_t;
-        	/* Leave the panel shift mode */
-        	borg_keypress(ESCAPE);
+        if (dir >= 7 && track_step_y[track_step_num -1] != c_y - 1)
+		{
+			if ((borg_projectable_pure(c_y,c_x, c_y-2, c_x)) ||
+			   ((borg_projectable_pure(c_y,c_x, c_y-2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x-2)) ||
+				borg_projectable_pure(c_y,c_x, c_y-2, c_x-2)) ||
+			   ((borg_projectable_pure(c_y,c_x, c_y-2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x+2)) ||
+				borg_projectable_pure(c_y,c_x, c_y-2, c_x+2)))
+			{
+				/* Send action (view panel info) */
+				borg_keypress('L');
+				if (dir) borg_keypress(I2D(dir));
+				borg_note("# Shifted panel as a precaution.");
+				/* Mark the time to avoid loops */
+				when_shift_panel = borg_t;
+        		/* Leave the panel shift mode */
+        		borg_keypress(ESCAPE);
+			}
         }
         else /* shift down? only if a south corridor */
-        if  (dir == 2 && borg_projectable_pure(c_y,c_x, c_y+2, c_x) &&
-            track_step_y[track_step_num -1] != c_y + 1)
+        if  (dir <= 3 && track_step_y[track_step_num -1] != c_y + 1)
         {
-            /* Send action (view panel info) */
-            borg_keypress('L');
-            borg_keypress(I2D(dir));
-            borg_note("# Shifted panel as a precaution.");
-            /* Mark the time to avoid loops */
-            when_shift_panel = borg_t;
-        	/* Leave the panel shift mode */
-        	borg_keypress(ESCAPE);
+			if ((borg_projectable_pure(c_y,c_x, c_y+2, c_x)) ||
+				((borg_projectable_pure(c_y,c_x, c_y+2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x-2)) ||
+				 borg_projectable_pure(c_y,c_x, c_y+2, c_x-2)) ||
+			    ((borg_projectable_pure(c_y,c_x, c_y+2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x+2)) ||
+				 borg_projectable_pure(c_y,c_x, c_y+2, c_x+2)))
+			{
+				/* Send action (view panel info) */
+				borg_keypress('L');
+				borg_keypress(I2D(dir));
+				borg_note("# Shifted panel as a precaution.");
+				/* Mark the time to avoid loops */
+				when_shift_panel = borg_t;
+        		/* Leave the panel shift mode */
+        		borg_keypress(ESCAPE);
+			}
         }
         else /* shift Left? only if a west corridor */
-        if  (dir == 4 && borg_projectable_pure(c_y,c_x, c_y, c_x-2) &&
+        if  ((dir == 4 || dir == 1 || dir == 7) &&
         track_step_x[track_step_num -1] != c_x - 1)
         {
-            /* Send action (view panel info) */
-            borg_keypress('L');
-            if (dir) borg_keypress(I2D(dir));
-            borg_note("# Shifted panel as a precaution.");
-            /* Mark the time to avoid loops */
-            when_shift_panel = borg_t;
-        	/* Leave the panel shift mode */
-        	borg_keypress(ESCAPE);
+			if ((borg_projectable_pure(c_y,c_x, c_y, c_x-2)) ||
+			((borg_projectable_pure(c_y,c_x, c_y+2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x-2)) ||
+				 borg_projectable_pure(c_y,c_x, c_y+2, c_x-2)) ||
+			((borg_projectable_pure(c_y,c_x, c_y-2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x-2)) ||
+				borg_projectable_pure(c_y,c_x, c_y-2, c_x-2)))
+			{
+				/* Send action (view panel info) */
+				borg_keypress('L');
+				if (dir) borg_keypress(I2D(dir));
+				borg_note("# Shifted panel as a precaution.");
+				/* Mark the time to avoid loops */
+				when_shift_panel = borg_t;
+        		/* Leave the panel shift mode */
+        		borg_keypress(ESCAPE);
+			}
         }
         else /* shift Right? only if a east corridor */
-        if  (dir == 6 && borg_projectable_pure(c_y,c_x, c_y, c_x+2) &&
-        track_step_x[track_step_num -1] != c_x + 1)
+        if  ((dir == 6 || dir == 9 || dir == 3) &&
+			  track_step_x[track_step_num -1] != c_x + 1)
         {
-            /* Send action (view panel info) */
-            borg_keypress('L');
-            if (dir) borg_keypress(I2D(dir));
-            borg_note("# Shifted panel as a precaution.");
-            /* Mark the time to avoid loops */
-            when_shift_panel = borg_t;
-        	/* Leave the panel shift mode */
-        	borg_keypress(ESCAPE);
+			if ((borg_projectable_pure(c_y,c_x, c_y, c_x+2)) ||
+				((borg_projectable_pure(c_y,c_x, c_y+2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x+2)) ||
+				 borg_projectable_pure(c_y,c_x, c_y+2, c_x+2)) ||
+				((borg_projectable_pure(c_y,c_x, c_y-2, c_x) &&
+				 borg_projectable_pure(c_y,c_x, c_y, c_x+2)) ||
+				borg_projectable_pure(c_y,c_x, c_y-2, c_x+2)))
+			{
+				/* Send action (view panel info) */
+				borg_keypress('L');
+				if (dir) borg_keypress(I2D(dir));
+				borg_note("# Shifted panel as a precaution.");
+				/* Mark the time to avoid loops */
+				when_shift_panel = borg_t;
+        		/* Leave the panel shift mode */
+        		borg_keypress(ESCAPE);
+			}
         }
-
-
     }
     /* This uses no energy */
     return (0);
@@ -12777,17 +13268,17 @@ static int borg_defend_aux_panel_shift(void)
 static int borg_defend_aux_rest(void)
 {
 	int i;
+	bool borg_lure_position = borg_lure_monster();
 
-	if (!borg_morgoth_position && (!borg_as_position || borg_t - borg_t_antisummon >= 50)) return (0);
+	/* Only if in a good place */
+	if (!borg_morgoth_position && !borg_lure_position && (!borg_as_position || borg_t - borg_t_antisummon >= 50)) return (0);
 
 	/* Not if Morgoth is not on this level */
-	if (!morgoth_on_level && (!borg_as_position || borg_t - borg_t_antisummon >= 50)) return (0);
+	if (!morgoth_on_level && !borg_lure_position && (!borg_as_position || borg_t - borg_t_antisummon >= 50)) return (0);
 
-	/* Not if I can not teleport others away */
-#if 0
-	if (!borg_spell_okay_fail(3, 1, 30) &&
-		!borg_prayer_okay_fail(4, 2, 30)) return (0);
-#endif
+	/* Do not camp too long */
+	if (time_this_panel > 350) return (0);
+
 	/* Not if a monster can see me */
     /* Examine all the monsters */
     for (i = 1; i < borg_kills_nxt; i++)
@@ -12852,9 +13343,6 @@ static int borg_defend_aux_tele_away_morgoth(void)
 
 	/* Not if Morgoth is not on this level */
 	if (!morgoth_on_level) return (0);
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* Do I have the T.O. spell? */
     if (!borg_spell_okay_fail(3, 1, fail_allowed) &&
@@ -12995,9 +13483,6 @@ static int borg_defend_aux_banishment_morgoth(void)
 	/* Not if Morgoth is not on this level */
 	if (!morgoth_on_level) return (0);
 
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
-
 	/* Scan grids looking for glyphs */
     for (i = 0; i < 8; i++)
     {
@@ -13120,9 +13605,6 @@ static int borg_defend_aux_light_morgoth(void)
 
 	/* Not if Morgoth is not on this level */
 	if (!morgoth_on_level) return (0);
-
-    /* Cant when screwed */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] || borg_skill[BI_ISFORGET]) return (0);
 
 	/* Do I have the spell? */
     if (!borg_spell_okay_fail(1, 6, fail_allowed) &&
@@ -13440,11 +13922,6 @@ static int borg_perma_aux_bless(void)
     /* already blessed */
     if (borg_bless)
         return (0);
-
-    /* Cant when Blind */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED]) return (0);
-
-    /* XXX Dark */
 
     if ( !borg_prayer_okay_fail(3, 0, fail_allowed))
         return (0);
@@ -13781,7 +14258,7 @@ static int borg_perma_aux_shield(void)
     if (borg_fighting_unique) fail_allowed = 15;
 
     /* if already protected */
-    if (borg_shield)
+    if (borg_shield || borg_stone)
         return (0);
 
     if (!borg_spell_okay_fail(4, 4, fail_allowed))
@@ -13865,11 +14342,6 @@ static int borg_perma_aux_hero(void)
     if (borg_hero)
         return (0);
 
-    /* Cant when Blind */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED]) return (0);
-
-    /* XXX Dark */
-
     if ( !borg_spell_okay_fail(7, 0, fail_allowed))
         return (0);
 
@@ -13913,11 +14385,6 @@ static int borg_perma_aux_berserk(void)
     if (borg_berserk)
         return (0);
 
-    /* Cant when Blind */
-    if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED]) return (0);
-
-    /* XXX Dark */
-
     if ( !borg_spell_okay_fail(7, 1, fail_allowed))
         return (0);
 
@@ -13957,7 +14424,7 @@ static int borg_perma_aux_berserk_potion(void)
         return (0);
 
     /* do I have any? */
-    if (-1 == borg_slot(TV_POTION,SV_POTION_BERSERK_STRENGTH))
+    if (!borg_equips_item(TV_POTION,SV_POTION_BERSERK_STRENGTH))
         return (0);
 
     /* Simulation */
@@ -14076,8 +14543,6 @@ static int borg_perma_aux_glyph(void)
 static int borg_perma_aux_see_inv(void)
 {
     int fail_allowed = 25;
-    borg_grid *ag = &borg_grids[c_y][c_x];
-
 
     /* no need */
     if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] ||
@@ -14088,9 +14553,6 @@ static int borg_perma_aux_see_inv(void)
     if (!borg_prayer_okay_fail(2, 3, fail_allowed) /* &&
         !borg_spell_okay_fail(2, 6, fail_allowed) */)
         return (0);
-
-    /* Darkness */
-    if (!(ag->info & BORG_GLOW) && !borg_skill[BI_CURLITE]) return (0);
 
     /* No real value known, but lets cast it to find the bad guys. */
     if (borg_simulate) return (10);
@@ -15354,7 +15816,8 @@ static bool borg_play_step(int y2, int x2)
         if (borg_skill[BI_ISHUNGRY]) return (FALSE);
 
 		/* Not when generally exploring */
-		if (goal == GOAL_DARK) return (FALSE);
+		if (goal == GOAL_DARK &&
+		    (ag->feat > FEAT_RUBBLE || borg_skill[BI_CLEVEL] < 10)) return (FALSE);
 
         /* Mega-Hack -- allow "stone to mud" */
         if (borg_spell(2, 2) ||
@@ -15375,17 +15838,14 @@ static bool borg_play_step(int y2, int x2)
         }
 
 		/* Some borgs just cant dig it */
-		if (borg_items[weapon_swap].tval != TV_DIGGING && borg_items[INVEN_WIELD].tval != TV_DIGGING &&
-			((ag->feat >= FEAT_MAGMA && ag->feat <= FEAT_QUARTZ_H && borg_skill[BI_CLEVEL] <= 30) ||
-		    (ag->feat >= FEAT_WALL_EXTRA && ag->feat <= FEAT_WALL_SOLID && borg_skill[BI_CLEVEL] <= 40)))
+		if ((borg_skill[BI_DIG] < BORG_DIG &&
+			 (borg_items[weapon_swap].tval != TV_DIGGING && borg_items[weapon_swap].tval != TV_DIGGING)) &&
+			(borg_skill[BI_DIG] < BORG_DIG + 20) && goal != GOAL_VAULT)
 	    {
 			/* Clear the flow grids and do not dig */
 			goal = 0;
 			return (FALSE);
 		}
-
-        /* Mega-Hack -- prevent infinite loops */
-        if (randint0(500) <= 5 && !vault_on_level) return (FALSE);
 
 
         /* Tunnel */
@@ -15721,7 +16181,7 @@ bool borg_flow_stair_both(int why, bool sneak)
 
 
     /* Spread the flow */
-    borg_flow_spread(250, FALSE, FALSE, FALSE, -1, sneak);
+    borg_flow_spread(250, FALSE, FALSE, FALSE, -1, sneak, FALSE);
 
 
     /* Attempt to Commit the flow */
@@ -15767,12 +16227,12 @@ bool borg_flow_stair_less(int why, bool sneak)
     if (borg_skill[BI_CLEVEL] > 35 || borg_skill[BI_CURLITE] == 0)
     {
         /* Spread the flow */
-        borg_flow_spread(250, TRUE, FALSE, FALSE, -1, sneak);
+        borg_flow_spread(250, TRUE, FALSE, FALSE, -1, sneak, FALSE);
     }
     else
     {
         /* Spread the flow, No Optimize, Avoid */
-        borg_flow_spread(250, FALSE, !borg_desperate, FALSE, -1, sneak);
+        borg_flow_spread(250, FALSE, !borg_desperate, FALSE, -1, sneak, FALSE);
     }
 
     /* Attempt to Commit the flow */
@@ -15833,7 +16293,7 @@ bool borg_flow_stair_more(int why, bool sneak, bool brave)
     }
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, sneak);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, sneak, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("down-stairs", why)) return (FALSE);
@@ -15953,7 +16413,7 @@ bool borg_flow_glyph(int why)
     }
 
     /* Reverse flow */
-    borg_flow_reverse(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_reverse(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Scan the entire map */
     for (y = 15; y < AUTO_MAX_Y-15; y++)
@@ -16120,7 +16580,7 @@ bool borg_flow_glyph(int why)
     borg_flow_enqueue_grid(b_y, b_x);
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("Glyph", GOAL_MISC)) return (FALSE);
@@ -16177,7 +16637,7 @@ bool borg_flow_light(int why)
     }
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("a lighted area", why)) return (FALSE);
@@ -16254,7 +16714,7 @@ bool borg_flow_vault(int nearness)
     }
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("vault excavation", GOAL_VAULT)) return (FALSE);
@@ -16469,7 +16929,7 @@ bool borg_flow_shop_visit(void)
     }
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("un-visited shops", GOAL_MISC)) return (FALSE);
@@ -16523,7 +16983,7 @@ bool borg_flow_shop_entry(int i)
     borg_flow_enqueue_grid(y, x);
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit(name, GOAL_MISC)) return (FALSE);
@@ -16626,7 +17086,7 @@ bool borg_flow_kill_aim(bool viewable)
                 c_y = s_c_y;
 
                 /* Spread the flow */
-                borg_flow_spread(5, TRUE, !viewable, FALSE, -1, FALSE);
+                borg_flow_spread(5, TRUE, !viewable, FALSE, -1, FALSE, FALSE);
 
                 /* Attempt to Commit the flow */
                 if (!borg_flow_commit("targetable position", GOAL_KILL)) return (FALSE);
@@ -16765,9 +17225,14 @@ bool borg_flow_kill_corridor_1(bool viewable)
 	if (!kill->awake) return (FALSE);
 
     /* Must have Stone to Mud spell */
-    if (!borg_spell_okay(2, 2) &&
+    if (borg_los(kill->y, kill->x, c_y, c_x))
+    {
+		if (!borg_spell_okay(2, 2) &&
 		!borg_equips_ring(SV_RING_DELVING) &&
-		!borg_equips_artifact(EFF_STONE_TO_MUD, INVEN_WIELD)) return (FALSE);
+		!borg_equips_artifact(EFF_STONE_TO_MUD, INVEN_WIELD) &&
+		(borg_items[weapon_swap].tval != TV_DIGGING && borg_items[weapon_swap].tval != TV_DIGGING &&
+		 borg_skill[BI_DIG] < BORG_DIG + 20)) return (FALSE);
+	}
 
 	/* Summoner needs to be able to follow me.
 	 * So I either need to be able to
@@ -16775,7 +17240,7 @@ bool borg_flow_kill_corridor_1(bool viewable)
 	 * 2) this panel needs to have had Magic Map or Wizard light cast on it.
 	 * If Mapped, then the flow codes needs to be used.
 	 */
-	if (!borg_los(kill->y, kill->x, c_y, c_x))
+	else
 	{
 		/* Extract panel */
 		q_x = w_x / PANEL_WID;
@@ -16789,16 +17254,16 @@ bool borg_flow_kill_corridor_1(bool viewable)
 			borg_flow_clear();
 			borg_digging = TRUE;
 			borg_flow_enqueue_grid(kill->y, kill->x);
-			borg_flow_spread(10, TRUE, FALSE, FALSE, -1, FALSE);
-			if (!borg_flow_commit("Monster Path", GOAL_KILL)) return (FALSE);
+			borg_flow_spread(10, TRUE, FALSE, FALSE, -1, FALSE, TRUE);
+			if (!borg_flow_commit(NULL, GOAL_KILL)) return (FALSE);
 		}
 		else
 		{
 			borg_flow_clear();
 			borg_digging = TRUE;
 			borg_flow_enqueue_grid(kill->y, kill->x);
-			borg_flow_spread(10, TRUE, TRUE, FALSE, -1, FALSE);
-			if (!borg_flow_commit("Monster Path", GOAL_KILL)) return (FALSE);
+			borg_flow_spread(10, TRUE, TRUE, FALSE, -1, FALSE, TRUE);
+			if (!borg_flow_commit(NULL, GOAL_KILL)) return (FALSE);
 		}
 	}
 
@@ -17036,7 +17501,7 @@ bool borg_flow_kill_corridor_1(bool viewable)
 		borg_flow_enqueue_grid(c_y + b_y + ny[7], c_x + b_x + nx[7]);
 
 		/* Spread the flow */
-        borg_flow_spread(5, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(5, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("anti-summon corridor north type 1", GOAL_DIGGING)) return (FALSE);
@@ -17056,7 +17521,7 @@ bool borg_flow_kill_corridor_1(bool viewable)
 		borg_flow_enqueue_grid(c_y + b_y + sy[17], c_x + b_x + sx[17]);
 
 		/* Spread the flow */
-        borg_flow_spread(6, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(6, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("anti-summon corridor south type 1", GOAL_DIGGING)) return (FALSE);
@@ -17077,7 +17542,7 @@ bool borg_flow_kill_corridor_1(bool viewable)
 
 		/* Spread the flow */
 		borg_digging = TRUE;
-        borg_flow_spread(5, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(5, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("anti-summon corridor east type 1", GOAL_DIGGING)) return (FALSE);
@@ -17097,7 +17562,7 @@ bool borg_flow_kill_corridor_1(bool viewable)
 		borg_flow_enqueue_grid(c_y + b_y + wy[11], c_x + b_x + wx[11]);
 
 		/* Spread the flow */
-        borg_flow_spread(5, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(5, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("anti-summon corridor west type 1", GOAL_DIGGING)) return (FALSE);
@@ -17246,7 +17711,7 @@ bool borg_flow_kill_corridor_2(bool viewable)
         borg_flow_enqueue_grid(m_y, m_x);
 
         /* Spread the flow */
-        borg_flow_spread(15, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(15, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("anti-summon corridor", GOAL_KILL)) return (FALSE);
@@ -17363,7 +17828,7 @@ bool borg_flow_recover(bool viewable, int dist)
     }
 
     /* Spread the flow */
-    borg_flow_spread(dist, FALSE, TRUE, FALSE, -1, FALSE);
+    borg_flow_spread(dist, FALSE, TRUE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("Recover Grid", GOAL_RECOVER)) return (FALSE);
@@ -17622,7 +18087,7 @@ bool borg_flow_kill(bool viewable, int nearness)
     /* if we are not flowing toward monsters that we can see, make sure they */
     /* are at least easily reachable.  The second flag is whether or not */
     /* to avoid unknown squares.  This was for performance when we have ESP. */
-    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, FALSE);
+    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, FALSE, FALSE);
 
 
     /* Attempt to Commit the flow */
@@ -17734,7 +18199,7 @@ bool borg_flow_vein(bool viewable, int nearness)
     /* if we are not flowing toward items that we can see, make sure they */
     /* are at least easily reachable.  The second flag is weather or not  */
     /* to avoid unkown squares.  This was for performance. */
-    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, FALSE);
+    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, FALSE, FALSE);
 
 
 	/* Attempt to Commit the flow */
@@ -17915,7 +18380,7 @@ bool borg_flow_take(bool viewable, int nearness)
     /* if we are not flowing toward items that we can see, make sure they */
     /* are at least easily reachable.  The second flag is weather or not  */
     /* to avoid unkown squares.  This was for performance. */
-    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, FALSE);
+    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, FALSE, FALSE);
 
 
     /* Attempt to Commit the flow */
@@ -18025,7 +18490,7 @@ bool borg_flow_take_scum(bool viewable, int nearness)
     /* if we are not flowing toward items that we can see, make sure they */
     /* are at least easily reachable.  The second flag is weather or not  */
     /* to avoid unknown squares.  This was for performance. */
-    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, TRUE);
+    borg_flow_spread(nearness, TRUE, !viewable, FALSE, -1, TRUE, FALSE);
 
 
     /* Attempt to Commit the flow */
@@ -18210,7 +18675,7 @@ bool borg_flow_take_lunal(bool viewable, int nearness)
     /* if we are not flowing toward items that we can see, make sure they */
     /* are at least easily reachable.  The second flag is weather or not  */
     /* to avoid unknown squares.  This was for performance. */
-    borg_flow_spread(nearness, FALSE, !viewable, FALSE, -1, TRUE);
+    borg_flow_spread(nearness, FALSE, !viewable, FALSE, -1, TRUE, FALSE);
 
 
     /* Attempt to Commit the flow */
@@ -18509,7 +18974,7 @@ bool borg_flow_kill_direct(bool viewable, bool twitchy)
         borg_flow_enqueue_grid(AUTO_MAX_Y / 2, AUTO_MAX_X / 2);
 
         /* Spread the flow */
-        borg_flow_spread(150, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(150, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("center direct", GOAL_KILL)) return (FALSE);
@@ -18532,7 +18997,7 @@ bool borg_flow_kill_direct(bool viewable, bool twitchy)
         borg_flow_enqueue_grid(kill->y, kill->x);
 
         /* Spread the flow */
-        borg_flow_spread(15, TRUE, FALSE, TRUE, -1, FALSE);
+        borg_flow_spread(15, TRUE, FALSE, TRUE, -1, FALSE, FALSE);
 
         /* Attempt to Commit the flow */
         if (!borg_flow_commit("kill direct", GOAL_KILL)) return (FALSE);
@@ -19161,7 +19626,7 @@ static bool borg_flow_dark_3(int b_stair)
     }
 
     /* Spread the flow (limit depth) */
-    borg_flow_spread(5, FALSE, TRUE, FALSE, -1, FALSE);
+    borg_flow_spread(5, FALSE, TRUE, FALSE, -1, FALSE, FALSE);
 
 
     /* Attempt to Commit the flow */
@@ -19279,12 +19744,12 @@ static bool borg_flow_dark_4(int b_stair)
 	if (borg_skill[BI_CLEVEL] < 15)
 	{
 		/* Short Leash */
-		borg_flow_spread(leash, TRUE, TRUE, FALSE, -1, FALSE);
+		borg_flow_spread(leash, TRUE, TRUE, FALSE, -1, FALSE, FALSE);
 	}
 	else
 	{
 		/* Long Leash */
-		borg_flow_spread(250, TRUE, TRUE, FALSE, -1, FALSE);
+		borg_flow_spread(250, TRUE, TRUE, FALSE, -1, FALSE, FALSE);
 	}
 
     /* Clear the edges */
@@ -19380,17 +19845,17 @@ static bool borg_flow_dark_5(int b_stair)
 	if (borg_skill[BI_CLEVEL] <= 5 && avoidance <= borg_skill[BI_CURHP])
 	{
 		/* Short Leash */
-		borg_flow_spread(leash, TRUE, TRUE, FALSE, -1, FALSE);
+		borg_flow_spread(leash, TRUE, TRUE, FALSE, -1, FALSE, FALSE);
 	}
 	else if (borg_skill[BI_CLEVEL] <= 30 && avoidance <= borg_skill[BI_CURHP])
 	{
 		/* Short Leash */
-		borg_flow_spread(leash, TRUE, TRUE, FALSE, -1, FALSE);
+		borg_flow_spread(leash, TRUE, TRUE, FALSE, -1, FALSE, FALSE);
 	}
 	else
 	{
 		/* Long Leash */
-		borg_flow_spread(250, TRUE, TRUE, FALSE, -1, FALSE);
+		borg_flow_spread(250, TRUE, TRUE, FALSE, -1, FALSE, FALSE);
 	}
 
     /* Attempt to Commit the flow */
@@ -19573,7 +20038,7 @@ bool borg_flow_spastic(bool bored)
 
 
     /* Reverse flow */
-    borg_flow_reverse(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_reverse(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Scan the entire map */
     for (y = 1; y < AUTO_MAX_Y-1; y++)
@@ -19761,7 +20226,7 @@ bool borg_flow_spastic(bool bored)
     borg_flow_enqueue_grid(b_y, b_x);
 
     /* Spread the flow */
-    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE);
+    borg_flow_spread(250, TRUE, FALSE, FALSE, -1, FALSE, FALSE);
 
     /* Attempt to Commit the flow */
     if (!borg_flow_commit("spastic", GOAL_XTRA)) return (FALSE);

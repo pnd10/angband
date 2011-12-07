@@ -1729,8 +1729,6 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
 	bitflag known_f[OF_SIZE];
 
     char *scan;
-	int i;
-
 
     /* Wipe the item */
     WIPE(item, borg_item);
@@ -1851,11 +1849,11 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
 					/* Quantity more than number charging */
 					if (item->iqty > number)
 					{
-						item->pval = 1;
+						item->pval = item->iqty - number;
 					}
 				}
 			}
-  			else item->pval = 1;
+  			else item->pval = item->iqty;
 		}
 	}
 
@@ -1919,13 +1917,13 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
     /* Base Cost -- Guess */
 
     /* Known items */
-    if (item->ident)
+    if (item->ident && !strstr(item->note, "cursed"))
     {
         /* Process various fields */
         item->value = borg_object_value_known(item);
     }
     /* Aware items */
-    else if (item->aware)
+    else if (item->aware && !strstr(item->note, "cursed"))
     {
         /* Aware items can assume template cost */
         item->value = k_info[item->kind].cost;
@@ -2005,6 +2003,7 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
             /* Save the tval/sval */
             item->tval = k_info[item->kind].tval;
             item->sval = k_info[item->kind].sval;
+
         }
 
         /* Extract the weight */
@@ -2024,7 +2023,7 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
 /*     item->discount = real_item->discount */
 
     /* Cursed indicators */
-    if (strstr(item->note, "cursed")) item->value = 0L;
+    if (strstr(item->note, "cursed") && !item->name1) item->value = 0L;
     else if (strstr(item->note, "{broken")) item->value = 0L;
     else if (strstr(item->note, "{terrible")) item->value = 0L;
     else if (strstr(item->note, "{worthless")) item->value = 0L;
@@ -2060,6 +2059,11 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
         item->pval = 0;
     }
 
+	/* Hack -- repair the One Ring */
+	if (item->name1 == RING_ONE ||
+		(item->tval == TV_RING &&
+		strstr(item->note, "special") &&
+		strstr(item->note, "cursed"))) item->value = 999999;
 
     /* XXX XXX XXX Repair various "ego-items" */
 
@@ -2096,50 +2100,6 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
 	 */
 	if (item->name2 == 61 || item->name2 == 21) item->name2 = 9;
 
-    /* Hack -- examine artifacts */
-    if (item->name1)
-    {
-        /* XXX XXX Hack -- fix "weird" artifacts */
-        if ((item->tval != a_info[item->name1].tval) ||
-            (item->sval != a_info[item->name1].sval))
-        {
-            /* Save the kind */
-            item->kind = borg_lookup_kind(item->tval, item->sval);
-
-            /* Save the tval/sval */
-            item->tval = k_info[item->kind].tval;
-            item->sval = k_info[item->kind].sval;
-        }
-
-        /* Extract the weight */
-        item->weight = a_info[item->name1].weight;
-
-     }
-
-
-    /* Known items */
-    if (item->ident)
-    {
-        /* Process various fields */
-        item->value = borg_object_value_known(item);
-		item->aware = TRUE;
-    }
-
-    /* Aware items */
-    else if (item->kind)
-    {
-        /* Aware items can assume template cost */
-        item->value = k_info[item->kind].cost;
-		item->aware = TRUE;
-    }
-	/* Non ID, assume some value */
-	else
-	{
-		item->value = 20L;
-		item->aware = FALSE;
-	}
-
-
     /* Parse various "inscriptions" */
     if (item->note[0])
     {
@@ -2152,30 +2112,6 @@ void borg_item_analyze(borg_item *item, object_type *real_item, char *desc)
         else if (streq(item->note, "{75% off}")) item->discount = 75;
         else if (streq(item->note, "{90% off}")) item->discount = 90;
 
-        /* Cursed indicators */
-        else if (strstr(item->note, "cursed}"))
-        {
-            /* One Ring is not junk */
-            if (item->activation != EFF_BIZARRE)
-            {
-                item->value = 0L;
-            }
-            item->cursed = TRUE;
-        }
-
-        else if (strstr(item->note, "broken")) item->value = 0L;
-        else if (strstr(item->note, "terrible")) item->value = 0L;
-        else if (strstr(item->note, "worthless")) item->value = 0L;
-
-        /* Ignore certain feelings */
-        /* "{average}" */
-        /* "{blessed}" */
-        /* "{magical}" */
-        /* "{excellent}" */
-        /* "{special}" */
-
-        /* Ignore special inscriptions */
-        /* "{empty}", "{tried}" */
     }
 
 
@@ -3227,7 +3163,7 @@ bool borg_equips_artifact(int activation, int location)
 }
 
 /*
- * Check and see if borg is wielding an artifact
+ * Check and see if borg is an item with an effect and it can be used immediately
  */
 bool borg_equips_item(int tval, int sval)
 {
@@ -3236,7 +3172,7 @@ bool borg_equips_item(int tval, int sval)
 	int skill;
 
     /* Check the equipment-- */
-    for (i = INVEN_WIELD; i < INVEN_TOTAL; i++)
+    for (i = 0; i < INVEN_TOTAL; i++)
     {
         borg_item *item = &borg_items[i];
 
@@ -3244,8 +3180,30 @@ bool borg_equips_item(int tval, int sval)
         if (item->tval != tval) continue;
         if (item->sval != sval) continue;
 
-        /* Check charge. */
-        if (item->timeout) continue;
+        /* Check charge on appropriate items. */
+        if ((item->tval != TV_POTION && item->tval != TV_SCROLL) &&
+			item->timeout) continue;
+
+		/* some items can't be used under certain circumstances */
+		if (item->tval == TV_SCROLL)
+		{
+			/* Blind, confused, dark */
+			/* Dark */
+			if (no_light()) continue;
+
+			/* Blind or Confused or Amnesia*/
+			if (borg_skill[BI_ISBLIND] || borg_skill[BI_ISCONFUSED] ||
+    			borg_skill[BI_ISFORGET]) continue;
+		}
+
+		if (item->tval == TV_WAND)
+		{
+			/* Confused*/
+			if (borg_skill[BI_ISCONFUSED]) continue;
+		}
+
+		/* Potions do not have a fail rate */
+		if (item->tval == TV_POTION || item->tval == TV_SCROLL) return (TRUE);
 
         /* Extract the item level for fail rate check*/
         lev = item->level;
@@ -3296,6 +3254,154 @@ bool borg_activate_item(int tval, int sval, bool target)
         /* Perform the action */
         borg_keypress('A');
         borg_keypress(I2A(i - INVEN_WIELD));
+
+		/* Some items require a target */
+		if (target)
+		{
+    	    borg_keypress('5');
+		}
+
+        /* Success */
+        return (TRUE);
+    }
+
+    /* Oops */
+    return (FALSE);
+}
+
+/*
+ * Check and see if borg is carrying an particular item which has an effect
+ * Effect: is the index of the effect we are looking for.
+ * Legal: is a check to see if the borg is able to cast the effect,
+ *        not necesarily right now.
+ *
+ * This method could be used for scrolls and potions.  But it is often a
+ * better idea to manually select which type of item we want the borg to
+ * consume.  So for now, we will just look at activatable equipment items.
+ */
+bool borg_has_effect(int effect, bool legal)
+{
+    int i;
+    int lev, fail;
+	int skill;
+	int start = INVEN_WIELD;
+
+    /* Check the entire inventory and equipment-- */
+    for (i = start; i < INVEN_TOTAL; i++)
+    {
+        borg_item *item = &borg_items[i];
+
+		/* Skip empty */
+		if (item->iqty <= 0) continue;
+
+		/* Wrong effect */
+		if (item->activation != effect) continue;
+
+		/* Randarts in dragonscale do not activate */
+		if ((effect < EFF_DRAGON_BLUE || effect > EFF_DRAGON_POWER) &&
+			item->tval == TV_DRAG_ARMOR) continue;
+
+        /* Check charge. */
+		if (!legal && item->timeout) continue;
+
+		/* Check for immediate capacity */
+		if (!legal)
+		{
+			switch (item->tval)
+			{
+				case TV_ROD:
+					/* Conditional prohibition? */
+					break;
+				case TV_WAND:
+					/* Conditional prohibition? */
+					break;
+				case TV_STAFF:
+					/* Conditional prohibition? */
+					break;
+				case TV_POTION:
+					/* Conditional prohibition? */
+					break;
+				case TV_SCROLL:
+					/* Blind, Confused */
+					break;
+			}
+
+		}
+
+        /* Extract the item level for fail rate check*/
+        lev = item->level;
+
+		/* Base chance of success */
+		skill = borg_skill[BI_DEV];
+
+		/* Confusion hurts skill */
+		if (borg_skill[BI_ISCONFUSED]) skill = skill * 75 / 100;
+
+		/* High level objects are harder */
+		fail = 100 * ((skill - lev) - (141 - 1)) / ((lev - skill) - (100 - 10));
+
+        /* Roll for usage.  Return Fail if greater than 50% fail.  Must beat 500 to succeed. */
+        if (fail > 500) continue;
+
+        /* Success */
+        return (TRUE);
+
+    }
+
+    /* I guess I dont have it, or it is not ready, or too hard to activate. */
+    return (FALSE);
+}
+
+/*
+ * Attempt to use the given equipment activation effect.
+ */
+bool borg_activate_effect(int effect, bool target)
+{
+    int i;
+	int start = INVEN_WIELD;
+
+    /* Check the entire inventory and equipment */
+    for (i = start; i < INVEN_TOTAL; i++)
+    {
+        borg_item *item = &borg_items[i];
+
+		/* Wrong effect */
+		if (item->activation != effect) continue;
+
+        /* Check charge */
+        if (item->timeout) return (FALSE);
+
+        /* Log the message */
+        borg_note(format("# Activating item %s.", item->desc));
+
+        /* Perform the action */
+        switch (item->tval)
+		{
+			case TV_ROD:
+				borg_keypress('z');
+				break;
+			case TV_WAND:
+				borg_keypress('a');
+				break;
+			case TV_STAFF:
+				borg_keypress('u');
+				break;
+			case TV_POTION:
+				borg_keypress('u');
+				break;
+			case TV_SCROLL:
+				borg_keypress('r');
+				break;
+			default:
+				borg_keypress('A');
+				break;
+		}
+
+		/* equipment */
+        if (i >= INVEN_WIELD) borg_keypress(I2A(i - INVEN_WIELD));
+
+		/* Inventory */
+		else borg_keypress(I2A(i));
 
 		/* Some items require a target */
 		if (target)
