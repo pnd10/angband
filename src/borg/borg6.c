@@ -378,6 +378,7 @@ static void borg_flow_spread(int depth, bool optimize, bool avoid, bool tunnelin
 			{
 				if (borg_skill[BI_CLEVEL] < 10 && ag->feat >= FEAT_SECRET) continue;
 				if (borg_skill[BI_CLEVEL] >= 10 && ag->feat > FEAT_RUBBLE) continue;
+				if (monster && ag->feat >= FEAT_RUBBLE) continue;
 			}
 
 			/* Avoid difficult tunneling */
@@ -1776,6 +1777,10 @@ void borg_near_monster_type(int dist)
 		/* Poison is really Bad */
         if (!borg_skill[BI_RPOIS] && /* Note the RPois not SRPois */
             (strstr(r_ptr->name, "Drolem"))) scaryguy_on_level = TRUE;
+
+		/* Tarrasque kills with Disenchant */
+        if (!borg_skill[BI_RDIS] && /* Note the RDisn not SRDisn */
+            (strstr(r_ptr->name, "Tarrasque"))) scaryguy_on_level = TRUE;
 
 
 		/* Now do distance considerations */
@@ -12858,7 +12863,7 @@ static int borg_defend_aux_banishment( int p1)
 		}
 
 		/* Unique Monster in good health*/
-        if (rf_has(r_ptr->flags, RF_UNIQUE) && kill->injury > 60)
+        if (rf_has(r_ptr->flags, RF_UNIQUE) && kill->injury > 60 && kill->injury < 85)
         {
 			/* Note who gets to stay */
 			if (!borg_simulate)
@@ -12869,6 +12874,17 @@ static int borg_defend_aux_banishment( int p1)
 			}
 
 			continue;
+		}
+
+        /* Unique Monster in nearly dead, finish him off!! */
+        if (rf_has(r_ptr->flags, RF_UNIQUE) && kill->injury >= 85)
+        {
+				borg_note(format("# Banishing Evil: (%d,%d): %s, danger %d. Unique not considered: Injury %d.",
+	    	      kill->y, kill->x, (r_info[kill->r_idx].name),
+	    	      borg_danger_aux(c_y,c_x, 1, ag->kill, TRUE, FALSE), kill->injury));
+
+				/* Do not boot anyone, attempt to kill the Unique */
+				return (FALSE);
 		}
 
 		/* Monsters in walls cant be booted */
@@ -15973,7 +15989,7 @@ bool borg_twitchy(void)
         return (TRUE);
     }
     /* Pick a random direction */
-	while (dir == 5 || dir == 0)
+	while (dir == 0)
 	{
 		dir = randint0(9);
 	}
